@@ -3,7 +3,7 @@ use crate::input::{self, DAY, Id, PARTITIONS, Shards, WEEK};
 use ahash::{AHashMap, RandomState};
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::hash_map::Entry};
 
 const INVALID_TIME: i64 = i64::MIN;
 const SESSION_GAP: i64 = 1_800_000;
@@ -61,7 +61,8 @@ pub struct Event {
     category: u32,
 }
 
-struct PendingEvent {
+#[derive(Clone, Copy)]
+pub struct PendingEvent {
     id: Key,
     ingest: i64,
     event: Event,
@@ -79,7 +80,6 @@ pub struct Context<'a> {
     pub end: i64,
     pub workers: usize,
     pub dimensions: &'a Dimensions<'a>,
-    pub aliases: &'a AHashMap<Key, Key>,
     pub names: &'a Names<'a>,
     pub hash: RandomState,
 }
@@ -91,10 +91,6 @@ impl<'a> Context<'a> {
     }
 
     #[inline]
-    fn person(&self, user: Key) -> Key {
-        self.aliases.get(&user).copied().unwrap_or(user)
-    }
-
     fn parse_event(&self, line: &'a [u8]) -> Option<(usize, PendingEvent)> {
         let [id, user, ts, ingest, kind, product, price] = input::fields(line)?;
         if id.is_empty() {
@@ -141,27 +137,42 @@ impl<'a> Context<'a> {
         Some((self.partition(id), PendingEvent { id, ingest, event }))
     }
 
-    pub fn events(&self, files: &'a [Mmap]) -> Vec<Shards<Event>> {
-        let by_id = input::route(files, self.workers, |line| self.parse_event(line));
+    pub fn read_events(&self, files: &'a [Mmap]) -> Vec<Shards<PendingEvent>> {
+        input::route(files, self.workers, |line| self.parse_event(line))
+    }
+
+    pub fn deduplicate_events(
+        &self,
+        by_id: Vec<Shards<PendingEvent>>,
+        aliases: &AHashMap<Key, Key>,
+    ) -> Vec<Shards<Event>> {
         let by_person = by_id
             .into_par_iter()
-            .map(|chunks| {
+            .map(|mut chunks| {
                 let capacity = chunks.iter().map(Vec::len).sum();
                 let mut winners = AHashMap::with_capacity(capacity);
-                for item in chunks.into_iter().flatten() {
-                    winners
-                        .entry(item.id)
-                        .and_modify(|winner: &mut (i64, Event)| {
-                            if item.ingest < winner.0 {
-                                *winner = (item.ingest, item.event);
+                // Store references to input records to keep the hash table
+                // small. The first slot for an ID retains its winning copy.
+                for item in chunks.iter_mut().flatten() {
+                    match winners.entry(item.id) {
+                        Entry::Vacant(slot) => {
+                            slot.insert(item);
+                        }
+                        Entry::Occupied(mut slot) => {
+                            let winner = slot.get_mut();
+                            if item.ingest < winner.ingest {
+                                **winner = *item;
                             }
-                        })
-                        .or_insert((item.ingest, item.event));
+                            item.event.time = INVALID_TIME;
+                        }
+                    }
                 }
+                drop(winners);
                 let mut shards = input::buckets();
-                for (_, mut event) in winners.into_values() {
+                for item in chunks.into_iter().flatten() {
+                    let mut event = item.event;
                     if event.time != INVALID_TIME {
-                        event.person = self.person(event.person);
+                        event.person = aliases.get(&event.person).copied().unwrap_or(event.person);
                         shards[self.partition(event.person)].push(event);
                     }
                 }
@@ -171,7 +182,11 @@ impl<'a> Context<'a> {
         input::transpose(by_person)
     }
 
-    pub fn clicks(&self, files: &'a [Mmap]) -> Vec<Shards<Click<'a>>> {
+    pub fn clicks(
+        &self,
+        files: &'a [Mmap],
+        aliases: &AHashMap<Key, Key>,
+    ) -> Vec<Shards<Click<'a>>> {
         input::route(files, self.workers, |line| {
             let [id, user, campaign, ts] = input::fields(line)?;
             if id.is_empty() || user.is_empty() {
@@ -182,7 +197,8 @@ impl<'a> Context<'a> {
             if time < self.start - WEEK || time >= self.end {
                 return None;
             }
-            let person = self.person(self.names.key(user));
+            let user = self.names.key(user);
+            let person = aliases.get(&user).copied().unwrap_or(user);
             // Repeated click IDs have identical values. Keeping copies cannot
             // change the winning click or whether a campaign is active.
             Some((

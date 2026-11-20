@@ -50,20 +50,30 @@ fn main() -> Result<()> {
     let campaign_file = input::map(&data.join("campaigns.csv"))?;
     let dimensions = rollup::Dimensions::new(&products, &campaign_file);
     let names = ids::Names::default();
-    let aliases = stage("resolve linked IDs", || input::aliases(&links, &names));
     let context = rollup::Context {
         start: bound("window_start")?,
         end: bound("window_end")?,
         workers,
         dimensions: &dimensions,
-        aliases: &aliases,
         names: &names,
         hash: RandomState::new(),
     };
-    let events = stage("read and deduplicate events", || {
-        context.events(&event_files)
-    });
-    let clicks = stage("read and validate clicks", || context.clicks(&click_files));
+    let (aliases, pending) = rayon::join(
+        || stage("resolve linked IDs", || input::aliases(&links, &names)),
+        || stage("parse events", || context.read_events(&event_files)),
+    );
+    let (events, clicks) = rayon::join(
+        || {
+            stage("deduplicate and route events", || {
+                context.deduplicate_events(pending, &aliases)
+            })
+        },
+        || {
+            stage("read and validate clicks", || {
+                context.clicks(&click_files, &aliases)
+            })
+        },
+    );
     let parquet = output::Parquet::new()?;
     let partials: Result<Vec<_>> = stage("sessionise, attribute and write users", || {
         events
