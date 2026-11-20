@@ -35,7 +35,7 @@ Generate the public development input with the organiser's generator.
 generate --seed 1 --events 1000000 --clicks 250000 --output .buildathon/dev
 ```
 
-The container reads from `/data`, writes both Parquet tables under `/output`,
+The container reads from `/data` and writes both Parquet tables under `/output`
 without intermediate files. The kit's runner defaults to the scorer's 8
 vCPUs, 24 GiB, no swap and offline settings.
 Stage timings go to standard output. The scorer measures total container
