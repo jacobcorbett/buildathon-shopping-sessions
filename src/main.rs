@@ -1,3 +1,4 @@
+mod ids;
 mod input;
 mod output;
 mod rollup;
@@ -48,13 +49,15 @@ fn main() -> Result<()> {
     let products = input::map(&data.join("products.csv"))?;
     let campaign_file = input::map(&data.join("campaigns.csv"))?;
     let dimensions = rollup::Dimensions::new(&products, &campaign_file);
-    let aliases = stage("resolve linked IDs", || input::aliases(&links));
+    let names = ids::Names::default();
+    let aliases = stage("resolve linked IDs", || input::aliases(&links, &names));
     let context = rollup::Context {
         start: bound("window_start")?,
         end: bound("window_end")?,
         workers,
         dimensions: &dimensions,
         aliases: &aliases,
+        names: &names,
         hash: RandomState::new(),
     };
     let events = stage("read and deduplicate events", || {
@@ -71,7 +74,11 @@ fn main() -> Result<()> {
                 let (rows, days) =
                     rollup::aggregate(input::merge(events), input::merge(clicks), &dimensions);
                 if partition == 0 || !rows.is_empty() {
-                    parquet.users(&rows, &users.join(format!("part-{partition:03}.parquet")))?;
+                    parquet.users(
+                        &rows,
+                        &names,
+                        &users.join(format!("part-{partition:03}.parquet")),
+                    )?;
                 }
                 Ok(days)
             })

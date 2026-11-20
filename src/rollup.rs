@@ -1,3 +1,4 @@
+use crate::ids::{Key, Names};
 use crate::input::{self, DAY, Id, PARTITIONS, Shards, WEEK};
 use ahash::{AHashMap, RandomState};
 use memmap2::Mmap;
@@ -53,21 +54,21 @@ impl<'a> Dimensions<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct Event<'a> {
-    person: Id<'a>,
+pub struct Event {
+    person: Key,
     time: i64,
     price: u32,
     category: u32,
 }
 
-struct PendingEvent<'a> {
-    id: Id<'a>,
+struct PendingEvent {
+    id: Key,
     ingest: i64,
-    event: Event<'a>,
+    event: Event,
 }
 
 pub struct Click<'a> {
-    person: Id<'a>,
+    person: Key,
     time: i64,
     id: Id<'a>,
     campaign: usize,
@@ -78,29 +79,30 @@ pub struct Context<'a> {
     pub end: i64,
     pub workers: usize,
     pub dimensions: &'a Dimensions<'a>,
-    pub aliases: &'a AHashMap<Id<'a>, Id<'a>>,
+    pub aliases: &'a AHashMap<Key, Key>,
+    pub names: &'a Names<'a>,
     pub hash: RandomState,
 }
 
 impl<'a> Context<'a> {
     #[inline]
-    fn partition(&self, id: Id<'a>) -> usize {
+    fn partition(&self, id: Key) -> usize {
         self.hash.hash_one(id) as usize & (PARTITIONS - 1)
     }
 
     #[inline]
-    fn person(&self, user: Id<'a>) -> Id<'a> {
-        self.aliases.get(user).copied().unwrap_or(user)
+    fn person(&self, user: Key) -> Key {
+        self.aliases.get(&user).copied().unwrap_or(user)
     }
 
-    fn parse_event(&self, line: &'a [u8]) -> Option<(usize, PendingEvent<'a>)> {
+    fn parse_event(&self, line: &'a [u8]) -> Option<(usize, PendingEvent)> {
         let [id, user, ts, ingest, kind, product, price] = input::fields(line)?;
         if id.is_empty() {
             return None;
         }
         let ingest = input::timestamp(ingest)?;
         let mut event = Event {
-            person: user,
+            person: 0,
             time: INVALID_TIME,
             price: 0,
             category: 0,
@@ -132,10 +134,14 @@ impl<'a> Context<'a> {
                 }
             }
         }
+        if event.time != INVALID_TIME {
+            event.person = self.names.key(user);
+        }
+        let id = self.names.key(id);
         Some((self.partition(id), PendingEvent { id, ingest, event }))
     }
 
-    pub fn events(&self, files: &'a [Mmap]) -> Vec<Shards<Event<'a>>> {
+    pub fn events(&self, files: &'a [Mmap]) -> Vec<Shards<Event>> {
         let by_id = input::route(files, self.workers, |line| self.parse_event(line));
         let by_person = by_id
             .into_par_iter()
@@ -145,7 +151,7 @@ impl<'a> Context<'a> {
                 for item in chunks.into_iter().flatten() {
                     winners
                         .entry(item.id)
-                        .and_modify(|winner: &mut (i64, Event<'a>)| {
+                        .and_modify(|winner: &mut (i64, Event)| {
                             if item.ingest < winner.0 {
                                 *winner = (item.ingest, item.event);
                             }
@@ -176,7 +182,7 @@ impl<'a> Context<'a> {
             if time < self.start - WEEK || time >= self.end {
                 return None;
             }
-            let person = self.person(user);
+            let person = self.person(self.names.key(user));
             // Repeated click IDs have identical values. Keeping copies cannot
             // change the winning click or whether a campaign is active.
             Some((
@@ -193,7 +199,7 @@ impl<'a> Context<'a> {
 }
 
 pub struct UserRow<'a> {
-    pub person: Id<'a>,
+    pub person: Key,
     pub day: i32,
     pub sessions: i64,
     pub events: i64,
@@ -334,7 +340,7 @@ fn top_category<'a>(totals: &[i64], names: &[Id<'a>]) -> Option<Id<'a>> {
 }
 
 fn sessionise<'a>(
-    events: &[Event<'a>],
+    events: &[Event],
     categories: &[Id<'a>],
     category_totals: &mut [i64],
     sessions: &mut Vec<Session>,
@@ -393,15 +399,15 @@ fn sessionise<'a>(
 }
 
 pub fn aggregate<'a>(
-    mut events: Vec<Event<'a>>,
+    mut events: Vec<Event>,
     mut clicks: Vec<Click<'a>>,
     dimensions: &Dimensions<'a>,
 ) -> (Vec<UserRow<'a>>, CampaignDays) {
-    events.sort_unstable_by(|a, b| a.person.cmp(b.person).then(a.time.cmp(&b.time)));
+    events.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.time.cmp(&b.time)));
     // Reverse click IDs within a timestamp, so the latest element wins ties.
     clicks.sort_unstable_by(|a, b| {
         a.person
-            .cmp(b.person)
+            .cmp(&b.person)
             .then(a.time.cmp(&b.time))
             .then_with(|| b.id.cmp(a.id))
     });
@@ -417,7 +423,7 @@ pub fn aggregate<'a>(
         let person = group[0].person;
         let mut matching_clicks = &[][..];
         while let Some(next) = click_groups.peek() {
-            match next[0].person.cmp(person) {
+            match next[0].person.cmp(&person) {
                 Ordering::Less => {
                     click_groups.next();
                 }

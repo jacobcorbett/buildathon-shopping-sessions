@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::ids::Names;
 use crate::input::Id;
 use crate::rollup::{CampaignDays, CampaignTally, UserRow};
 use parquet::basic::Compression;
@@ -84,11 +85,15 @@ impl Parquet {
         )?)
     }
 
-    pub fn users(&self, rows: &[UserRow<'_>], path: &Path) -> Result<()> {
+    pub fn users(&self, rows: &[UserRow<'_>], names: &Names<'_>, path: &Path) -> Result<()> {
         let mut file = self.writer(path, &self.users)?;
         if !rows.is_empty() {
             let mut group = file.next_row_group()?;
-            column::<ByteArrayType, _>(&mut group, rows.iter().map(|r| bytes(r.person)), None)?;
+            column::<ByteArrayType, _>(
+                &mut group,
+                rows.iter().map(|r| ByteArray::from(names.bytes(r.person))),
+                None,
+            )?;
             column::<Int32Type, _>(&mut group, rows.iter().map(|r| r.day), None)?;
             column::<Int64Type, _>(&mut group, rows.iter().map(|r| r.sessions), None)?;
             column::<Int64Type, _>(&mut group, rows.iter().map(|r| r.events), None)?;

@@ -1,3 +1,4 @@
+use crate::ids::{Key, Names};
 use ahash::AHashMap;
 use memchr::memchr;
 use memmap2::{Mmap, MmapOptions};
@@ -232,7 +233,7 @@ pub fn merge<T>(mut parts: Shards<T>) -> Vec<T> {
     result
 }
 
-pub fn aliases(files: &[Mmap]) -> AHashMap<Id<'_>, Id<'_>> {
+pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>) -> AHashMap<Key, Key> {
     fn root(parent: &mut [usize], mut node: usize) -> usize {
         while parent[node] != node {
             parent[node] = parent[parent[node]];
@@ -253,11 +254,12 @@ pub fn aliases(files: &[Mmap]) -> AHashMap<Id<'_>, Id<'_>> {
             continue;
         }
         let mut index = |id| {
-            *ids.entry(id).or_insert_with(|| {
+            let key = names.key(id);
+            *ids.entry(key).or_insert_with(|| {
                 let n = parent.len();
                 parent.push(n);
                 sizes.push(1);
-                minimum.push(id);
+                minimum.push((id, key));
                 n
             })
         };
@@ -273,8 +275,10 @@ pub fn aliases(files: &[Mmap]) -> AHashMap<Id<'_>, Id<'_>> {
         sizes[a] += sizes[b];
         minimum[a] = minimum[a].min(minimum[b]);
     }
-    ids.retain(|id, node| *id != minimum[root(&mut parent, *node)]);
     ids.into_iter()
-        .map(|(id, node)| (id, minimum[root(&mut parent, node)]))
+        .filter_map(|(key, node)| {
+            let person = minimum[root(&mut parent, node)].1;
+            (key != person).then_some((key, person))
+        })
         .collect()
 }
