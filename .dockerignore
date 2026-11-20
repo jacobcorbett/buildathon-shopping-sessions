@@ -6,3 +6,5 @@ data
 output
 scratch
 **/__pycache__
+
+target

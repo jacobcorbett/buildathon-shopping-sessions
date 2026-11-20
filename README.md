@@ -1,9 +1,8 @@
 # Shopping Sessions
 
-Buildathon entry for the Databricks clickstream pipeline challenge. DuckDB
-sessionises linked identities and produces exact user and campaign daily
-aggregates. A streaming C++ reader enforces the track's CSV dialect before
-DuckDB scans the data.
+Buildathon entry for the Databricks clickstream pipeline challenge. The
+native Rust executable validates the track's CSV dialect, resolves linked
+identities, sessionises events and writes both daily aggregates as Parquet.
 
 [Official track brief, rules and starter assets](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
 
@@ -37,7 +36,7 @@ generate --seed 1 --events 1000000 --clicks 250000 --output .buildathon/dev
 ```
 
 The container reads from `/data`, writes both Parquet tables under `/output`,
-and uses `/scratch` for normalised inputs and DuckDB spill files. The kit's
-runner defaults to the scorer's 8 vCPUs, 24 GiB, no swap and offline settings.
+without intermediate files. The kit's runner defaults to the scorer's 8
+vCPUs, 24 GiB, no swap and offline settings.
 Stage timings go to standard output. The scorer measures total container
 wall time.

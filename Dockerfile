@@ -1,12 +1,14 @@
-FROM debian:bookworm-slim AS build
-RUN apt-get update && apt-get install -y --no-install-recommends g++ \
-    && rm -rf /var/lib/apt/lists/*
-COPY pipeline/normalise.cpp /src/normalise.cpp
-RUN g++ -std=c++20 -O3 -Wall -Wextra -Werror /src/normalise.cpp -o /normalise
+FROM rust:1.99.1-slim-trixie AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+# Cascade Lake and newer scorer CPUs support the x86-64-v3 instruction set.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked --jobs 4 \
+    && cp target/release/shopping-sessions /shopping-sessions
 
-FROM python:3.12-slim-bookworm
-RUN pip install --no-cache-dir duckdb==1.5.6
-COPY --from=build /normalise /usr/local/bin/normalise
-COPY pipeline/ /app/
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-CMD ["python", "/app/pipeline.py"]
+FROM debian:trixie-slim
+COPY --from=build /shopping-sessions /usr/local/bin/shopping-sessions
+CMD ["/usr/local/bin/shopping-sessions"]
