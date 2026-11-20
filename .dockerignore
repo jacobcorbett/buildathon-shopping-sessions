@@ -1,0 +1,8 @@
+.git
+.buildathon
+.env*
+.venv
+data
+output
+scratch
+**/__pycache__
