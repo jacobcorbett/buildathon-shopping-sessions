@@ -1,46 +1,36 @@
--- stage: timestamp parsing
-CREATE MACRO millis(s) AS (
-    CASE
-        WHEN regexp_full_match(s, '[0-9]+')
-            THEN try_cast(coalesce(nullif(ltrim(s, '0'), ''), '0') AS BIGINT)
-        WHEN regexp_full_match(
-            s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])'
-        )
-            THEN epoch_ms(try_strptime(left(s, 19), '%Y-%m-%dT%H:%M:%S'))
-                - CASE WHEN length(s) = 20 THEN 0 ELSE
-                    (CASE WHEN s[20] = '+' THEN 1 ELSE -1 END)
-                    * (s[21:22]::BIGINT * 60 + s[24:25]::BIGINT) * 60000
-                  END
-    END
-);
-CREATE MACRO purchase_price(s) AS (
-    CASE WHEN regexp_full_match(s, '[0-9]+') THEN try_cast(ltrim(s, '0') AS BIGINT) END
-);
-
 -- stage: deduplicate and validate events
 CREATE TABLE events AS
 WITH winners AS (
-    SELECT arg_min(struct_pack(user_id := user_id, ts := ts, event_type := event_type,
-                   product_id := product_id, price_cents := price_cents,
-                   ingest_ts := ingest_ts), ingest_ts) AS event
+    -- Mark bad payloads with a null timestamp while retaining their event IDs
+    -- and ingest time so that a later valid duplicate cannot replace them.
+    SELECT arg_min(
+        struct_pack(
+            user_id := user_id,
+            ts := CASE WHEN product_id IS NOT NULL AND (
+                event_type IN ('view', 'cart')
+                OR (event_type = 'purchase' AND price_cents BETWEEN 1 AND 10000000)
+            ) THEN ts END,
+            bought_product := CASE WHEN event_type = 'purchase' THEN product_id END,
+            price := price_cents,
+            ingest_ts := ingest_ts
+        ),
+        ingest_ts
+    ) AS event
     FROM raw_events
     WHERE event_id IS NOT NULL
     GROUP BY event_id
 ), parsed AS (
-    SELECT event.user_id AS user_id, millis(event.ts) AS ts, event.ingest_ts AS ingest_ts,
-           CASE WHEN event.event_type = 'purchase' THEN event.product_id END AS bought_product,
-           CASE WHEN event.event_type = 'purchase' THEN purchase_price(event.price_cents) END AS price
+    SELECT event.user_id AS user_id, event.ts AS ts, event.ingest_ts AS ingest_ts,
+           event.bought_product AS bought_product, event.price AS price
     FROM winners
-    WHERE event.user_id IS NOT NULL AND event.product_id IS NOT NULL
-        AND event.event_type IN ('view', 'cart', 'purchase')
+    WHERE event.user_id IS NOT NULL
 )
 SELECT coalesce(i.person, p.user_id) AS person, p.ts, p.bought_product, p.price
 FROM parsed p
 CROSS JOIN bounds b
 LEFT JOIN identities i USING (user_id)
 WHERE p.ts >= b.start_ms AND p.ts < b.end_ms
-    AND (p.bought_product IS NULL OR p.price BETWEEN 1 AND 10000000)
-    AND epoch_ms(strptime(p.ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) - p.ts <= 86400000;
+    AND p.ts >= p.ingest_ts - 86400000;
 
 -- stage: sessionise and aggregate events
 -- RANGE includes all events at the current timestamp, including peers of the
@@ -98,12 +88,9 @@ WITH unique_clicks AS (
     SELECT DISTINCT click_id, user_id, campaign_id, ts
     FROM raw_clicks
     WHERE click_id IS NOT NULL AND user_id IS NOT NULL
-), parsed AS (
-    SELECT click_id, user_id, campaign_id, millis(ts) AS ts
-    FROM unique_clicks
 )
 SELECT coalesce(i.person, p.user_id) AS person, p.click_id, p.campaign_id, p.ts
-FROM parsed p
+FROM unique_clicks p
 JOIN raw_campaigns c USING (campaign_id)
 LEFT JOIN identities i USING (user_id)
 CROSS JOIN bounds b

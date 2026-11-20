@@ -18,6 +18,7 @@ OUTPUT = Path(os.environ.get("OUTPUT_DIR", "/output"))
 SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
 THREADS = int(os.environ.get("NCPU", "8"))
 MEMORY = int(os.environ.get("MEM_GB", "24"))
+INTEGER_FIELDS = {"ts", "ingest_ts", "price_cents"}
 SCHEMAS = {
     "events": ("event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"),
     "clicks": ("click_id", "user_id", "campaign_id", "ts"),
@@ -38,8 +39,12 @@ def normalise(source, destination, width):
     subprocess.run(["normalise", str(width), source, destination], check=True)
 
 
+def sql_type(field):
+    return "BIGINT" if field in INTEGER_FIELDS else "VARCHAR"
+
+
 def csv_view(db, name, files, fields):
-    columns = "{" + ", ".join(f"'{field}': 'VARCHAR'" for field in fields) + "}"
+    columns = "{" + ", ".join(f"'{field}': '{sql_type(field)}'" for field in fields) + "}"
     db.sql(
         rf"""
         SELECT * FROM read_csv(?, columns={columns}, auto_detect=false,
@@ -71,7 +76,7 @@ def prepare_inputs(db, workspace):
         if paths:
             csv_view(db, f"raw_{name}", paths, SCHEMAS[name])
         else:
-            columns = ", ".join(f"NULL::VARCHAR AS {field}" for field in SCHEMAS[name])
+            columns = ", ".join(f"NULL::{sql_type(field)} AS {field}" for field in SCHEMAS[name])
             db.execute(f"CREATE VIEW raw_{name} AS SELECT {columns} WHERE false")
 
 
