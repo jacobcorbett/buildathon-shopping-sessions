@@ -124,10 +124,10 @@ pub struct PendingEvent<P> {
 }
 
 #[derive(Clone, Copy)]
-pub struct Click<'a> {
+pub struct Click {
     person: Key,
     time: i64,
-    id: Id<'a>,
+    id: Key,
     campaign: usize,
 }
 
@@ -137,7 +137,7 @@ pub struct Context<'a> {
     pub end: i64,
     pub workers: usize,
     pub dimensions: &'a Dimensions<'a>,
-    pub names: &'a Names<'a>,
+    pub names: &'a Names,
     pub hash: RandomState,
 }
 
@@ -148,7 +148,7 @@ impl<'a> Context<'a> {
     }
 
     #[inline]
-    fn parse_event<P: Payload>(&self, line: &'a [u8]) -> Option<(usize, PendingEvent<P>)> {
+    fn parse_event<P: Payload>(&self, line: &[u8]) -> Option<(usize, PendingEvent<P>)> {
         let [id, user, ts, ingest, kind, product, price] = input::fields(line)?;
         if id.is_empty() {
             return None;
@@ -198,7 +198,7 @@ impl<'a> Context<'a> {
         Some((self.partition(id), PendingEvent { id, ingest, event }))
     }
 
-    pub fn read_events<P: Payload>(&self, files: &'a [Mmap]) -> Vec<Shards<PendingEvent<P>>> {
+    pub fn read_events<P: Payload>(&self, files: &[Mmap]) -> Vec<Shards<PendingEvent<P>>> {
         input::route(
             files,
             self.workers,
@@ -277,7 +277,7 @@ impl<'a> Context<'a> {
         input::transpose(by_person, USER_GROUPS)
     }
 
-    pub fn clicks(&self, files: &'a [Mmap], aliases: &input::Aliases) -> Vec<Shards<Click<'a>>> {
+    pub fn clicks(&self, files: &[Mmap], aliases: &input::Aliases) -> Vec<Shards<Click>> {
         input::route(
             files,
             self.workers,
@@ -302,7 +302,7 @@ impl<'a> Context<'a> {
                     Click {
                         person,
                         time,
-                        id,
+                        id: self.names.key(id),
                         campaign,
                     },
                 ))
@@ -378,7 +378,7 @@ impl Attribution {
         }
     }
 
-    fn attribute(&mut self, sessions: &[Session], clicks: &[Click<'_>], days: &mut CampaignDays) {
+    fn attribute(&mut self, sessions: &[Session], clicks: &[Click], days: &mut CampaignDays) {
         let mut lower = 0;
         let mut upper = 0;
         let campaign_count = self.states.len();
@@ -533,9 +533,10 @@ struct Group {
 pub fn aggregate<'a, P: Payload>(
     events: Shards<Event<P>>,
     origin: i64,
-    clicks: Shards<Click<'a>>,
+    clicks: Shards<Click>,
     dimensions: &Dimensions<'a>,
     people: &input::People,
+    names: &Names,
     rows: &mut Vec<UserRow<'a>>,
     days: &mut CampaignDays,
 ) {
@@ -595,7 +596,7 @@ pub fn aggregate<'a, P: Payload>(
         Click {
             person: 0,
             time: 0,
-            id: &[],
+            id: 0,
             campaign: 0
         };
         click_offset
@@ -614,7 +615,7 @@ pub fn aggregate<'a, P: Payload>(
         let events = &mut sorted_events[group.event_end - group.n_events..group.event_end];
         let clicks = &mut sorted_clicks[group.click_end - group.n_clicks..group.click_end];
         P::sort(events);
-        clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| b.id.cmp(a.id)));
+        clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| names.compare(b.id, a.id)));
         sessionise(
             group.person,
             events,

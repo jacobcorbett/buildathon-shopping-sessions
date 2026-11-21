@@ -72,18 +72,18 @@ fn main() -> Result<()> {
     {
         run::<u64>(
             &context,
-            &event_files,
-            &click_files,
-            &links,
+            event_files,
+            click_files,
+            links,
             &users,
             &campaigns,
         )
     } else {
         run::<rollup::Wide>(
             &context,
-            &event_files,
-            &click_files,
-            &links,
+            event_files,
+            click_files,
+            links,
             &users,
             &campaigns,
         )
@@ -92,9 +92,9 @@ fn main() -> Result<()> {
 
 fn run<'a, P: rollup::Payload>(
     context: &rollup::Context<'a>,
-    event_files: &'a [memmap2::Mmap],
-    click_files: &'a [memmap2::Mmap],
-    links: &'a [memmap2::Mmap],
+    event_files: Vec<memmap2::Mmap>,
+    click_files: Vec<memmap2::Mmap>,
+    links: Vec<memmap2::Mmap>,
     users: &std::path::Path,
     campaigns: &std::path::Path,
 ) -> Result<()> {
@@ -103,55 +103,69 @@ fn run<'a, P: rollup::Payload>(
     let (aliases, pending) = rayon::join(
         || {
             stage("resolve linked IDs", || {
-                input::aliases(links, names, context.people)
+                input::aliases(&links, names, context.people)
             })
         },
-        || stage("parse events", || context.read_events::<P>(event_files)),
+        || stage("parse events", || context.read_events::<P>(&event_files)),
     );
-    let (events, clicks) = rayon::join(
-        || {
-            stage("deduplicate and route events", || {
-                context.deduplicate_events(pending, &aliases)
-            })
+    let (_, (events, clicks)) = rayon::join(
+        move || {
+            drop(links);
+            drop(event_files);
         },
         || {
-            stage("read and validate clicks", || {
-                context.clicks(click_files, &aliases)
-            })
+            rayon::join(
+                || {
+                    stage("deduplicate and route events", || {
+                        context.deduplicate_events(pending, &aliases)
+                    })
+                },
+                || {
+                    stage("read and validate clicks", || {
+                        context.clicks(&click_files, &aliases)
+                    })
+                },
+            )
         },
     );
     let parquet = output::Parquet::new()?;
-    let partials: Result<Vec<_>> = stage("sessionise, attribute and write users", || {
-        let groups: Vec<_> = events.into_iter().zip(clicks).collect();
-        groups
-            .into_par_iter()
-            .chunks(rollup::USER_GROUPS / input::PARTITIONS)
-            .enumerate()
-            .map(|(partition, groups)| {
-                let mut rows = Vec::new();
-                let mut days = rollup::CampaignDays::new();
-                for (events, clicks) in groups {
-                    rollup::aggregate(
-                        events,
-                        context.start,
-                        clicks,
-                        dimensions,
-                        context.people,
-                        &mut rows,
-                        &mut days,
-                    );
-                }
-                if partition == 0 || !rows.is_empty() {
-                    parquet.users(
-                        &rows,
-                        names,
-                        &users.join(format!("part-{partition:03}.parquet")),
-                    )?;
-                }
-                Ok(days)
+    let (_, partials) = rayon::join(
+        move || drop(click_files),
+        || -> Result<Vec<_>> {
+            stage("sessionise, attribute and write users", || {
+                let groups: Vec<_> = events.into_iter().zip(clicks).collect();
+                groups
+                    .into_par_iter()
+                    .chunks(rollup::USER_GROUPS / input::PARTITIONS)
+                    .enumerate()
+                    .map(|(partition, groups)| {
+                        let mut rows = Vec::new();
+                        let mut days = rollup::CampaignDays::new();
+                        for (events, clicks) in groups {
+                            rollup::aggregate(
+                                events,
+                                context.start,
+                                clicks,
+                                dimensions,
+                                context.people,
+                                names,
+                                &mut rows,
+                                &mut days,
+                            );
+                        }
+                        if partition == 0 || !rows.is_empty() {
+                            parquet.users(
+                                &rows,
+                                names,
+                                &users.join(format!("part-{partition:03}.parquet")),
+                            )?;
+                        }
+                        Ok(days)
+                    })
+                    .collect()
             })
-            .collect()
-    });
+        },
+    );
     let mut days = rollup::CampaignDays::new();
     for partial in partials? {
         for (day, values) in partial {

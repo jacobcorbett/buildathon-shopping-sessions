@@ -85,7 +85,7 @@ impl Parquet {
         )?)
     }
 
-    pub fn users(&self, rows: &[UserRow<'_>], names: &Names<'_>, path: &Path) -> Result<()> {
+    pub fn users(&self, rows: &[UserRow<'_>], names: &Names, path: &Path) -> Result<()> {
         let mut file = self.writer(path, &self.users)?;
         if !rows.is_empty() {
             let mut group = file.next_row_group()?;

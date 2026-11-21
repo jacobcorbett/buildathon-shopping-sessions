@@ -1,6 +1,6 @@
 use crate::input::Id;
-use ahash::AHashMap;
-use std::sync::Mutex;
+use ahash::{AHashMap, RandomState};
+use std::sync::{Arc, Mutex};
 
 pub type Key = u64;
 const INTERNED: Key = 1 << 63;
@@ -8,14 +8,15 @@ const LONG_ASCII_MIN: Key = 2 << 56;
 const ASCII_BITS: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 
 #[derive(Default)]
-struct Interned<'a> {
-    keys: AHashMap<Id<'a>, Key>,
-    values: Vec<Id<'a>>,
+struct Interned {
+    keys: AHashMap<Arc<[u8]>, Key>,
+    values: Vec<Arc<[u8]>>,
 }
 
 #[derive(Default)]
-pub struct Names<'a> {
-    interned: Mutex<Interned<'a>>,
+pub struct Names {
+    interned: [Mutex<Interned>; 32],
+    hash: RandomState,
 }
 
 #[inline]
@@ -46,9 +47,9 @@ fn unpack(packed: u64) -> [u8; 8] {
     }
 }
 
-impl<'a> Names<'a> {
+impl Names {
     #[inline]
-    pub fn key(&self, id: Id<'a>) -> Key {
+    pub fn key(&self, id: Id<'_>) -> Key {
         // Nine ASCII bytes fit in 63 bits. Reserve the two lowest
         // possible leading bytes for shorter, length-marked ASCII keys.
         if let Ok(short) = <&[u8; 9]>::try_from(id) {
@@ -69,28 +70,39 @@ impl<'a> Names<'a> {
     }
 
     #[cold]
-    fn intern(&self, id: Id<'a>) -> Key {
-        let mut state = self.interned.lock().unwrap();
+    fn intern(&self, id: Id<'_>) -> Key {
+        let shard = self.hash.hash_one(id) as usize % self.interned.len();
+        let mut state = self.interned[shard].lock().unwrap();
         if let Some(&key) = state.keys.get(id) {
             return key;
         }
-        let key = INTERNED | state.values.len() as u64;
-        state.values.push(id);
+        let key =
+            INTERNED | (state.values.len() as u64 * self.interned.len() as u64) | shard as u64;
+        let id = Arc::<[u8]>::from(id);
+        state.values.push(id.clone());
         state.keys.insert(id, key);
         key
     }
 
-    pub fn less(&self, a: Key, b: Key) -> bool {
+    pub fn compare(&self, a: Key, b: Key) -> std::cmp::Ordering {
+        if a == b {
+            return std::cmp::Ordering::Equal;
+        }
         if (LONG_ASCII_MIN..INTERNED).contains(&a) && (LONG_ASCII_MIN..INTERNED).contains(&b) {
-            a < b
+            a.cmp(&b)
         } else {
-            self.bytes(a) < self.bytes(b)
+            self.bytes(a).cmp(&self.bytes(b))
         }
     }
 
     pub fn bytes(&self, key: Key) -> Vec<u8> {
         if key & INTERNED != 0 {
-            return self.interned.lock().unwrap().values[(key & !INTERNED) as usize].to_vec();
+            let id = (key & !INTERNED) as usize;
+            return self.interned[id % self.interned.len()]
+                .lock()
+                .unwrap()
+                .values[id / self.interned.len()]
+            .to_vec();
         }
         if key < LONG_ASCII_MIN {
             let length = key.ilog2() as usize / 7;

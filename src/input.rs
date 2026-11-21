@@ -430,7 +430,7 @@ impl Aliases {
     }
 }
 
-pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>, people: &People) -> Aliases {
+pub fn aliases(files: &[Mmap], names: &Names, people: &People) -> Aliases {
     fn root(parent: &mut [usize], mut i: usize) -> usize {
         while i != parent[i] {
             parent[i] = parent[parent[i]];
@@ -452,7 +452,10 @@ pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>, people: &People) -> Ali
         let a = root(&mut parent, a);
         let b = root(&mut parent, b);
         if a != b {
-            if names.less(people.key(a as Key), people.key(b as Key)) {
+            if names
+                .compare(people.key(a as Key), people.key(b as Key))
+                .is_lt()
+            {
                 parent[b] = a;
             } else {
                 parent[a] = b;
