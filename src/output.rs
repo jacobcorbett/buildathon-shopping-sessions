@@ -58,6 +58,67 @@ fn bytes(value: &[u8]) -> ByteArray {
     ByteArray::from(value.to_vec())
 }
 
+// Encode the required UTF-8 user column directly into standard PLAIN pages.
+// Each packed key can append its bytes without allocating an owned string.
+fn user_ids<W: Write + Send>(
+    group: &mut SerializedRowGroupWriter<'_, W>,
+    descriptor: parquet::schema::types::ColumnDescPtr,
+    rows: &[UserRow<'_>],
+    names: &Names,
+) -> Result<()> {
+    use bytes::Bytes;
+    use parquet::basic::Encoding;
+    use parquet::column::page::{CompressedPage, Page, PageWriter};
+    use parquet::column::writer::ColumnCloseResult;
+    use parquet::file::metadata::ColumnChunkMetaData;
+    use parquet::file::writer::{SerializedPageWriter, TrackedWrite};
+    let mut encoded = TrackedWrite::new(Vec::<u8>::new());
+    let mut uncompressed = 0usize;
+    let mut encoder = snap::raw::Encoder::new();
+    for batch in rows.chunks(8192) {
+        let mut plain = Vec::with_capacity(batch.len() * 16);
+        for row in batch {
+            names.with_bytes(row.person, |id| -> Result<()> {
+                plain.extend_from_slice(&i32::try_from(id.len())?.to_le_bytes());
+                plain.extend_from_slice(id);
+                Ok(())
+            })?;
+        }
+        let compressed = encoder.compress_vec(&plain)?;
+        let n = plain.len();
+        let page = Page::DataPage {
+            buf: compressed.into(),
+            num_values: batch.len() as u32,
+            encoding: Encoding::PLAIN,
+            def_level_encoding: Encoding::RLE,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        };
+        let page =
+            SerializedPageWriter::new(&mut encoded).write_page(CompressedPage::new(page, n))?;
+        uncompressed += page.uncompressed_size;
+    }
+    let bytes = Bytes::from(encoded.into_inner()?);
+    let metadata = ColumnChunkMetaData::builder(descriptor)
+        .set_encodings(vec![Encoding::PLAIN, Encoding::RLE])
+        .set_compression(Compression::SNAPPY)
+        .set_num_values(rows.len() as i64)
+        .set_data_page_offset(0)
+        .set_total_compressed_size(bytes.len() as i64)
+        .set_total_uncompressed_size(uncompressed as i64)
+        .build()?;
+    let close = ColumnCloseResult {
+        bytes_written: bytes.len() as u64,
+        rows_written: rows.len() as u64,
+        metadata,
+        bloom_filter: None,
+        column_index: None,
+        offset_index: None,
+    };
+    group.append_column(&bytes, close)?;
+    Ok(())
+}
+
 impl Parquet {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -88,12 +149,9 @@ impl Parquet {
     pub fn users(&self, rows: &[UserRow<'_>], names: &Names, path: &Path) -> Result<()> {
         let mut file = self.writer(path, &self.users)?;
         if !rows.is_empty() {
+            let user = file.schema_descr().column(0);
             let mut group = file.next_row_group()?;
-            column::<ByteArrayType, _>(
-                &mut group,
-                rows.iter().map(|r| ByteArray::from(names.bytes(r.person))),
-                None,
-            )?;
+            user_ids(&mut group, user, rows, names)?;
             column::<Int32Type, _>(&mut group, rows.iter().map(|r| r.day), None)?;
             column::<Int64Type, _>(&mut group, rows.iter().map(|r| r.sessions), None)?;
             column::<Int64Type, _>(&mut group, rows.iter().map(|r| r.events), None)?;

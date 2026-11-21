@@ -447,11 +447,13 @@ name = "shopping-sessions"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "bytes",
  "memchr",
  "memmap2",
  "parquet",
  "rayon",
  "serde_json",
+ "snap",
 ]
 
 [[package]]

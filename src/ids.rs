@@ -107,23 +107,23 @@ impl Names {
         }
     }
 
-    pub fn bytes(&self, key: Key) -> Vec<u8> {
+    pub fn with_bytes<T>(&self, key: Key, consume: impl FnOnce(&[u8]) -> T) -> T {
         if key & INTERNED != 0 {
             let id = (key & !INTERNED) as usize;
-            return self.interned[id % self.interned.len()]
-                .lock()
-                .unwrap()
-                .values[id / self.interned.len()]
-            .to_vec();
+            let state = self.interned[id % self.interned.len()].lock().unwrap();
+            return consume(&state.values[id / self.interned.len()]);
         }
         if key < LONG_ASCII_MIN {
             let length = key.ilog2() as usize / 7;
             let packed = key ^ (1 << (length * 7));
-            return unpack(packed)[8 - length..].to_vec();
+            return consume(&unpack(packed)[8 - length..]);
         }
         let mut id = [0; 9];
         id[..8].copy_from_slice(&unpack(key >> 7));
         id[8] = (key & 0x7f) as u8;
-        id.to_vec()
+        consume(&id)
+    }
+    pub fn bytes(&self, key: Key) -> Vec<u8> {
+        self.with_bytes(key, |id| id.to_vec())
     }
 }
