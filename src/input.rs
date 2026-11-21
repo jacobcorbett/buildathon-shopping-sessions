@@ -1,5 +1,5 @@
 use crate::ids::{Key, Names};
-use ahash::AHashMap;
+use ahash::RandomState;
 use memchr::memchr;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
@@ -35,6 +35,10 @@ pub fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 #[inline]
 pub fn fields<const N: usize>(mut line: &[u8]) -> Option<[&[u8]; N]> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if (32..=128).contains(&line.len()) {
+        return masked_fields(line);
+    }
     let mut result = [&[][..]; N];
     for (index, field) in result.iter_mut().enumerate() {
         let raw = if index + 1 == N {
@@ -59,6 +63,50 @@ pub fn fields<const N: usize>(mut line: &[u8]) -> Option<[&[u8]; N]> {
         *field = value;
     }
     Some(result)
+}
+
+// Read overlapping vectors at the tail so every load stays within the line.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn masked_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    use core::arch::x86_64::*;
+    let mut commas = 0u128;
+    let mut quote_mask = 0u128;
+    let mut offset = 0;
+    loop {
+        // Caller guarantees at least 32 bytes and offset <= len - 32.
+        unsafe {
+            let block = _mm256_loadu_si256(line.as_ptr().add(offset).cast());
+            let mask =
+                |c| _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, _mm256_set1_epi8(c))) as u32;
+            commas |= u128::from(mask(b',' as i8)) << offset;
+            quote_mask |= u128::from(mask(b'"' as i8)) << offset;
+        }
+        if offset + 32 == line.len() {
+            break;
+        }
+        offset = (offset + 32).min(line.len() - 32);
+    }
+    if commas.count_ones() as usize != N - 1 {
+        return None;
+    }
+    let mut result = [&[][..]; N];
+    let mut stripped = 0;
+    let mut start = 0;
+    for field in &mut result {
+        let end = if commas == 0 {
+            line.len()
+        } else {
+            commas.trailing_zeros() as usize
+        };
+        commas &= commas.wrapping_sub(1);
+        let raw = &line[start..end];
+        let quoted = usize::from(raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"');
+        stripped += 2 * quoted;
+        *field = &raw[quoted..raw.len() - quoted];
+        start = end + 1;
+    }
+    (quote_mask.count_ones() as usize == stripped).then_some(result)
 }
 
 #[inline]
@@ -98,12 +146,45 @@ fn ascii_calendar(bytes: &[u8]) -> Option<i64> {
     if bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
         return None;
     }
-    let year = pair(bytes, 0)? * 100 + pair(bytes, 2)?;
-    let month = pair(bytes, 5)?;
-    let day = pair(bytes, 8)?;
-    let hour = pair(bytes, 11)?;
-    let minute = pair(bytes, 14)?;
-    let second = pair(bytes, 17)?;
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    let [year, month, day, hour, minute, second] = {
+        use core::arch::x86_64::*;
+        // Read the final 16 bytes of YYYY-MM-DDTHH:MM:SS. Shuffle the
+        // decimal pairs together, validate their digits, then multiply-add.
+        unsafe {
+            let digits = _mm_sub_epi8(
+                _mm_loadu_si128(bytes.as_ptr().add(3).cast()),
+                _mm_set1_epi8(b'0' as i8),
+            );
+            let order = _mm_setr_epi8(2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1, -1, -1);
+            let digits = _mm_shuffle_epi8(digits, order);
+            if _mm_movemask_epi8(_mm_cmpeq_epi8(
+                _mm_min_epu8(digits, _mm_set1_epi8(9)),
+                digits,
+            )) != 65535
+            {
+                return None;
+            }
+            let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+            [
+                pair(bytes, 0)? * 100 + pair(bytes, 2)?,
+                _mm_extract_epi16::<0>(pairs) as u32,
+                _mm_extract_epi16::<1>(pairs) as u32,
+                _mm_extract_epi16::<2>(pairs) as u32,
+                _mm_extract_epi16::<3>(pairs) as u32,
+                _mm_extract_epi16::<4>(pairs) as u32,
+            ]
+        }
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+    let [year, month, day, hour, minute, second] = [
+        pair(bytes, 0)? * 100 + pair(bytes, 2)?,
+        pair(bytes, 5)?,
+        pair(bytes, 8)?,
+        pair(bytes, 11)?,
+        pair(bytes, 14)?,
+        pair(bytes, 17)?,
+    ];
     if !(1..=12).contains(&month) || day == 0 || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
@@ -182,12 +263,12 @@ pub fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
 
 pub type Shards<T> = Vec<Vec<T>>;
 
-pub fn buckets<T>() -> Shards<T> {
-    (0..PARTITIONS).map(|_| Vec::new()).collect()
+pub fn buckets<T>(count: usize) -> Shards<T> {
+    (0..count).map(|_| Vec::new()).collect()
 }
 
-pub fn transpose<T>(parts: Vec<Shards<T>>) -> Vec<Shards<T>> {
-    let mut grouped = buckets();
+pub fn transpose<T>(parts: Vec<Shards<T>>, count: usize) -> Vec<Shards<T>> {
+    let mut grouped = buckets(count);
     for part in parts {
         for (position, items) in part.into_iter().enumerate() {
             if !items.is_empty() {
@@ -201,6 +282,8 @@ pub fn transpose<T>(parts: Vec<Shards<T>>) -> Vec<Shards<T>> {
 pub fn route<'a, T: Send>(
     files: &'a [Mmap],
     workers: usize,
+    bytes_per_row: usize,
+    partitions: usize,
     parse: impl Fn(&'a [u8]) -> Option<(usize, T)> + Sync,
 ) -> Vec<Shards<T>> {
     let chunks = chunks(files);
@@ -209,9 +292,20 @@ pub fn route<'a, T: Send>(
     let parts = (0..groups)
         .into_par_iter()
         .map(|index| {
-            let mut shards = buckets();
-            for chunk in chunks.iter().skip(index).step_by(groups) {
-                for line in chunk.split(|&byte| byte == b'\n') {
+            let assigned = chunks.iter().skip(index).step_by(groups);
+            let bytes: usize = assigned.clone().map(|chunk| chunk.len()).sum();
+            let mut shards: Shards<T> = (0..partitions)
+                .map(|_| Vec::with_capacity(bytes / bytes_per_row / partitions))
+                .collect();
+            for chunk in assigned {
+                for line in memchr::memchr_iter(b'\n', chunk)
+                    .chain(std::iter::once(chunk.len()))
+                    .scan(0, |start, end| {
+                        let line = chunk.get(*start..end)?;
+                        *start = end + 1;
+                        Some(line)
+                    })
+                {
                     if let Some((partition, item)) = parse(line) {
                         shards[partition].push(item);
                     }
@@ -220,7 +314,18 @@ pub fn route<'a, T: Send>(
             shards
         })
         .collect();
-    transpose(parts)
+    transpose(parts, partitions)
+}
+
+#[inline]
+pub fn prefetch<T>(item: &T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(
+            (item as *const T).cast(),
+            core::arch::x86_64::_MM_HINT_T0,
+        );
+    }
 }
 
 pub fn merge<T>(mut parts: Shards<T>) -> Vec<T> {
@@ -233,19 +338,72 @@ pub fn merge<T>(mut parts: Shards<T>) -> Vec<T> {
     result
 }
 
-pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>) -> AHashMap<Key, Key> {
-    fn root(parent: &mut [usize], mut node: usize) -> usize {
-        while parent[node] != node {
-            parent[node] = parent[parent[node]];
-            node = parent[node];
+// During union, values are parent slots. The last pass replaces each slot
+// with its canonical key for a single lookup per event or click.
+#[derive(Clone, Copy, Default)]
+struct AliasSlot {
+    key: Key,
+    value: Key,
+}
+
+pub struct Aliases {
+    slots: Vec<AliasSlot>,
+    hash: RandomState,
+}
+
+impl Aliases {
+    #[inline]
+    fn slot(&self, key: Key) -> usize {
+        let mask = self.slots.len() - 1;
+        let mut i = self.hash.hash_one(key) as usize & mask;
+        while self.slots[i].key != 0 && self.slots[i].key != key {
+            i = (i + 1) & mask;
         }
-        node
+        i
     }
 
-    let mut ids = AHashMap::new();
-    let mut parent = Vec::new();
-    let mut sizes = Vec::new();
-    let mut minimum = Vec::new();
+    #[inline]
+    pub fn prefetch(&self, key: Key) {
+        let slot = self.hash.hash_one(key) as usize & (self.slots.len() - 1);
+        prefetch(&self.slots[slot]);
+    }
+
+    #[inline]
+    pub fn person(&self, key: Key) -> Key {
+        let slot = self.slot(key);
+        if self.slots[slot].key == 0 {
+            key
+        } else {
+            self.slots[slot].value
+        }
+    }
+
+    fn root(&mut self, key: Key) -> usize {
+        let mut i = self.slot(key);
+        if self.slots[i].key == 0 {
+            self.slots[i].key = key;
+            self.slots[i].value = i as Key;
+        }
+        while self.slots[i].value != i as Key {
+            self.slots[i].value = self.slots[self.slots[i].value as usize].value;
+            i = self.slots[i].value as usize;
+        }
+        i
+    }
+}
+
+pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>) -> Aliases {
+    let rows: usize = files
+        .iter()
+        .map(|file| memchr::memchr_iter(b'\n', file).count())
+        .sum();
+    // Including headers covers a final row without LF. At most two new keys
+    // can occur per row, leaving an empty slot even for disjoint links.
+    let capacity = (rows * 2 + 1).next_power_of_two();
+    let mut map = Aliases {
+        slots: vec![AliasSlot::default(); capacity],
+        hash: RandomState::new(),
+    };
     for [left, right] in files
         .iter()
         .flat_map(|file| lines(file).filter_map(fields::<2>))
@@ -253,32 +411,28 @@ pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>) -> AHashMap<Key, Key> {
         if left.is_empty() || right.is_empty() {
             continue;
         }
-        let mut index = |id| {
-            let key = names.key(id);
-            *ids.entry(key).or_insert_with(|| {
-                let n = parent.len();
-                parent.push(n);
-                sizes.push(1);
-                minimum.push((id, key));
-                n
-            })
-        };
-        let (left, right) = (index(left), index(right));
-        let (mut a, mut b) = (root(&mut parent, left), root(&mut parent, right));
-        if a == b {
-            continue;
+        let a = map.root(names.key(left));
+        let b = map.root(names.key(right));
+        if a != b {
+            if names.less(map.slots[a].key, map.slots[b].key) {
+                map.slots[b].value = a as Key;
+            } else {
+                map.slots[a].value = b as Key;
+            }
         }
-        if sizes[a] < sizes[b] {
-            std::mem::swap(&mut a, &mut b);
-        }
-        parent[b] = a;
-        sizes[a] += sizes[b];
-        minimum[a] = minimum[a].min(minimum[b]);
     }
-    ids.into_iter()
-        .filter_map(|(key, node)| {
-            let person = minimum[root(&mut parent, node)].1;
-            (key != person).then_some((key, person))
-        })
-        .collect()
+    for slot in 0..capacity {
+        if map.slots[slot].key != 0 {
+            let mut root = map.slots[slot].value as usize;
+            while map.slots[root].value != root as Key {
+                root = map.slots[root].value as usize;
+            }
+            map.slots[slot].value = root as Key;
+        }
+    }
+    for i in 0..capacity {
+        let root = map.slots[i].value as usize;
+        map.slots[i].value = map.slots[root].key;
+    }
+    map
 }

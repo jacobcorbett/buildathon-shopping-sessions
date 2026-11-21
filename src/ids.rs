@@ -80,6 +80,14 @@ impl<'a> Names<'a> {
         key
     }
 
+    pub fn less(&self, a: Key, b: Key) -> bool {
+        if (LONG_ASCII_MIN..INTERNED).contains(&a) && (LONG_ASCII_MIN..INTERNED).contains(&b) {
+            a < b
+        } else {
+            self.bytes(a) < self.bytes(b)
+        }
+    }
+
     pub fn bytes(&self, key: Key) -> Vec<u8> {
         if key & INTERNED != 0 {
             return self.interned.lock().unwrap().values[(key & !INTERNED) as usize].to_vec();

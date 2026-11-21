@@ -3,8 +3,9 @@ use crate::input::{self, DAY, Id, PARTITIONS, Shards, WEEK};
 use ahash::{AHashMap, RandomState};
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::{cmp::Ordering, collections::hash_map::Entry};
+use std::cmp::Ordering;
 
+pub const USER_GROUPS: usize = PARTITIONS * 8;
 const INVALID_TIME: i64 = i64::MIN;
 const SESSION_GAP: i64 = 1_800_000;
 
@@ -53,19 +54,67 @@ impl<'a> Dimensions<'a> {
     }
 }
 
+pub trait Payload: Copy + Send + Sync {
+    fn encode(time: i64, price: u32, category: u32, origin: i64) -> Self;
+    fn time(self, origin: i64) -> i64;
+    fn price(self) -> u32;
+    fn category(self) -> u32;
+}
+
 #[derive(Clone, Copy)]
-pub struct Event {
-    person: Key,
+pub struct Wide {
     time: i64,
     price: u32,
     category: u32,
 }
 
+impl Payload for Wide {
+    fn encode(time: i64, price: u32, category: u32, _: i64) -> Self {
+        Self {
+            time,
+            price,
+            category,
+        }
+    }
+    fn time(self, _: i64) -> i64 {
+        self.time
+    }
+    fn price(self) -> u32 {
+        self.price
+    }
+    fn category(self) -> u32 {
+        self.category
+    }
+}
+
+// The caller checks the window and category count. Valid prices fit in
+// 24 bits by the track rules. Invalid records have a zero person key.
+impl Payload for u64 {
+    fn encode(time: i64, price: u32, category: u32, origin: i64) -> Self {
+        ((time.wrapping_sub(origin) as u64) << 32) | (u64::from(category) << 24) | u64::from(price)
+    }
+    fn time(self, origin: i64) -> i64 {
+        origin + (self >> 32) as i64
+    }
+    fn price(self) -> u32 {
+        self as u32 & 0xff_ffff
+    }
+    fn category(self) -> u32 {
+        (self as u32) >> 24
+    }
+}
+
 #[derive(Clone, Copy)]
-pub struct PendingEvent {
+pub struct Event<P> {
+    person: Key,
+    payload: P,
+}
+
+#[derive(Clone, Copy)]
+pub struct PendingEvent<P> {
     id: Key,
     ingest: i64,
-    event: Event,
+    event: Event<P>,
 }
 
 pub struct Click<'a> {
@@ -91,14 +140,13 @@ impl<'a> Context<'a> {
     }
 
     #[inline]
-    fn parse_event(&self, line: &'a [u8]) -> Option<(usize, PendingEvent)> {
+    fn parse_event<P: Payload>(&self, line: &'a [u8]) -> Option<(usize, PendingEvent<P>)> {
         let [id, user, ts, ingest, kind, product, price] = input::fields(line)?;
         if id.is_empty() {
             return None;
         }
         let ingest = input::timestamp(ingest)?;
-        let mut event = Event {
-            person: 0,
+        let mut data = Wide {
             time: INVALID_TIME,
             price: 0,
             category: 0,
@@ -110,14 +158,14 @@ impl<'a> Context<'a> {
                 .filter(|&time| time >= self.start && time < self.end && time >= ingest - DAY)
             {
                 match kind {
-                    b"view" | b"cart" => event.time = time,
+                    b"view" | b"cart" => data.time = time,
                     b"purchase" => {
                         if let Some(price) =
                             input::number(price).filter(|value| (1..=10_000_000).contains(value))
                         {
-                            event.time = time;
-                            event.price = price as u32;
-                            event.category = self
+                            data.time = time;
+                            data.price = price as u32;
+                            data.category = self
                                 .dimensions
                                 .products
                                 .get(product)
@@ -130,64 +178,85 @@ impl<'a> Context<'a> {
                 }
             }
         }
-        if event.time != INVALID_TIME {
-            event.person = self.names.key(user);
-        }
+        let event = Event {
+            person: if data.time != INVALID_TIME {
+                self.names.key(user)
+            } else {
+                0
+            },
+            payload: P::encode(data.time, data.price, data.category, self.start),
+        };
         let id = self.names.key(id);
         Some((self.partition(id), PendingEvent { id, ingest, event }))
     }
 
-    pub fn read_events(&self, files: &'a [Mmap]) -> Vec<Shards<PendingEvent>> {
-        input::route(files, self.workers, |line| self.parse_event(line))
+    pub fn read_events<P: Payload>(&self, files: &'a [Mmap]) -> Vec<Shards<PendingEvent<P>>> {
+        input::route(files, self.workers, 72, PARTITIONS, |line| {
+            self.parse_event(line)
+        })
     }
 
-    pub fn deduplicate_events(
+    pub fn deduplicate_events<P: Payload>(
         &self,
-        by_id: Vec<Shards<PendingEvent>>,
-        aliases: &AHashMap<Key, Key>,
-    ) -> Vec<Shards<Event>> {
+        by_id: Vec<Shards<PendingEvent<P>>>,
+        aliases: &input::Aliases,
+    ) -> Vec<Shards<Event<P>>> {
         let by_person = by_id
             .into_par_iter()
-            .map(|mut chunks| {
-                let capacity = chunks.iter().map(Vec::len).sum();
-                let mut winners = AHashMap::with_capacity(capacity);
-                // Store references to input records to keep the hash table
-                // small. The first slot for an ID retains its winning copy.
-                for item in chunks.iter_mut().flatten() {
-                    match winners.entry(item.id) {
-                        Entry::Vacant(slot) => {
-                            slot.insert(item);
+            .map(|chunks| {
+                let capacity: usize = chunks.iter().map(Vec::len).sum();
+                // Two bitmaps identify hash slots hit more than once. Only
+                // those records need the exact-key table and ingest comparison.
+                let slots = (capacity * 8 + 1).next_power_of_two().max(64);
+                let mask = slots - 1;
+                let mut seen = vec![0u64; slots / 64];
+                let mut repeated = vec![0u64; slots / 64];
+                let slot = |key| (self.hash.hash_one(key) as usize / PARTITIONS) & mask;
+                for item in chunks.iter().flatten() {
+                    let pos = slot(item.id);
+                    let bit = 1u64 << (pos % 64);
+                    repeated[pos / 64] |= seen[pos / 64] & bit;
+                    seen[pos / 64] |= bit;
+                }
+                let mut shards: Shards<Event<P>> = (0..USER_GROUPS)
+                    .map(|_| Vec::with_capacity(capacity / USER_GROUPS))
+                    .collect();
+                let mut emit = |mut event: Event<P>| {
+                    if event.person != 0 {
+                        event.person = aliases.person(event.person);
+                        shards[self.hash.hash_one(event.person) as usize % USER_GROUPS].push(event);
+                    }
+                };
+                let mut winners = AHashMap::with_capacity(capacity / 8);
+                for chunk in &chunks {
+                    for batch in chunk.chunks(32) {
+                        for item in batch {
+                            aliases.prefetch(item.event.person);
                         }
-                        Entry::Occupied(mut slot) => {
-                            let winner = slot.get_mut();
-                            if item.ingest < winner.ingest {
-                                **winner = *item;
+                        for item in batch {
+                            let pos = slot(item.id);
+                            if repeated[pos / 64] & (1u64 << (pos % 64)) == 0 {
+                                emit(item.event);
+                            } else {
+                                let winner = winners.entry(item.id).or_insert(item);
+                                if item.ingest < winner.ingest {
+                                    *winner = item;
+                                }
                             }
-                            item.event.time = INVALID_TIME;
                         }
                     }
                 }
-                drop(winners);
-                let mut shards = input::buckets();
-                for item in chunks.into_iter().flatten() {
-                    let mut event = item.event;
-                    if event.time != INVALID_TIME {
-                        event.person = aliases.get(&event.person).copied().unwrap_or(event.person);
-                        shards[self.partition(event.person)].push(event);
-                    }
+                for winner in winners.into_values() {
+                    emit(winner.event);
                 }
                 shards
             })
             .collect();
-        input::transpose(by_person)
+        input::transpose(by_person, USER_GROUPS)
     }
 
-    pub fn clicks(
-        &self,
-        files: &'a [Mmap],
-        aliases: &AHashMap<Key, Key>,
-    ) -> Vec<Shards<Click<'a>>> {
-        input::route(files, self.workers, |line| {
+    pub fn clicks(&self, files: &'a [Mmap], aliases: &input::Aliases) -> Vec<Shards<Click<'a>>> {
+        input::route(files, self.workers, 48, USER_GROUPS, |line| {
             let [id, user, campaign, ts] = input::fields(line)?;
             if id.is_empty() || user.is_empty() {
                 return None;
@@ -198,11 +267,11 @@ impl<'a> Context<'a> {
                 return None;
             }
             let user = self.names.key(user);
-            let person = aliases.get(&user).copied().unwrap_or(user);
+            let person = aliases.person(user);
             // Repeated click IDs have identical values. Keeping copies cannot
             // change the winning click or whether a campaign is active.
             Some((
-                self.partition(person),
+                self.hash.hash_one(person) as usize % USER_GROUPS,
                 Click {
                     person,
                     time,
@@ -355,8 +424,9 @@ fn top_category<'a>(totals: &[i64], names: &[Id<'a>]) -> Option<Id<'a>> {
     category
 }
 
-fn sessionise<'a>(
-    events: &[Event],
+fn sessionise<'a, P: Payload>(
+    events: &[Event<P>],
+    origin: i64,
     categories: &[Id<'a>],
     category_totals: &mut [i64],
     sessions: &mut Vec<Session>,
@@ -364,7 +434,7 @@ fn sessionise<'a>(
 ) {
     let person = events[0].person;
     let mut session = Session {
-        start: events[0].time,
+        start: events[0].payload.time(origin),
         revenue: 0,
     };
     let mut day_row = UserRow {
@@ -377,10 +447,10 @@ fn sessionise<'a>(
     };
     let mut previous = session.start;
     for event in events {
-        if event.time - previous > SESSION_GAP {
+        if event.payload.time(origin) - previous > SESSION_GAP {
             sessions.push(session);
             session = Session {
-                start: event.time,
+                start: event.payload.time(origin),
                 revenue: 0,
             };
             let start_day = day(session.start);
@@ -399,13 +469,13 @@ fn sessionise<'a>(
             }
             day_row.sessions += 1;
         }
-        previous = event.time;
+        previous = event.payload.time(origin);
         day_row.events += 1;
-        if event.price != 0 {
-            let price = i64::from(event.price);
+        if event.payload.price() != 0 {
+            let price = i64::from(event.payload.price());
             session.revenue += price;
             day_row.revenue += price;
-            category_totals[event.category as usize] += price;
+            category_totals[event.payload.category() as usize] += price;
         }
     }
     sessions.push(session);
@@ -414,12 +484,19 @@ fn sessionise<'a>(
     category_totals.fill(0);
 }
 
-pub fn aggregate<'a>(
-    mut events: Vec<Event>,
+pub fn aggregate<'a, P: Payload>(
+    mut events: Vec<Event<P>>,
+    origin: i64,
     mut clicks: Vec<Click<'a>>,
     dimensions: &Dimensions<'a>,
-) -> (Vec<UserRow<'a>>, CampaignDays) {
-    events.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.time.cmp(&b.time)));
+    user_rows: &mut Vec<UserRow<'a>>,
+    days: &mut CampaignDays,
+) {
+    events.sort_unstable_by(|a, b| {
+        a.person
+            .cmp(&b.person)
+            .then(a.payload.time(origin).cmp(&b.payload.time(origin)))
+    });
     // Reverse click IDs within a timestamp, so the latest element wins ties.
     clicks.sort_unstable_by(|a, b| {
         a.person
@@ -430,8 +507,7 @@ pub fn aggregate<'a>(
     let mut click_groups = clicks
         .chunk_by(|left, right| left.person == right.person)
         .peekable();
-    let mut user_rows = Vec::new();
-    let mut days = CampaignDays::new();
+
     let mut session_buffer = Vec::new();
     let mut category_totals = vec![0; dimensions.categories.len()];
     let mut attribution = Attribution::new(dimensions.campaigns.len());
@@ -452,13 +528,13 @@ pub fn aggregate<'a>(
         }
         sessionise(
             group,
+            origin,
             &dimensions.categories,
             &mut category_totals,
             &mut session_buffer,
-            &mut user_rows,
+            user_rows,
         );
-        attribution.attribute(&session_buffer, matching_clicks, &mut days);
+        attribution.attribute(&session_buffer, matching_clicks, days);
         session_buffer.clear();
     }
-    (user_rows, days)
 }

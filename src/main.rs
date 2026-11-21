@@ -58,9 +58,42 @@ fn main() -> Result<()> {
         names: &names,
         hash: RandomState::new(),
     };
+    if context.end.abs_diff(context.start) <= u64::from(u32::MAX)
+        && dimensions.categories.len() <= 256
+    {
+        run::<u64>(
+            &context,
+            &event_files,
+            &click_files,
+            &links,
+            &users,
+            &campaigns,
+        )
+    } else {
+        run::<rollup::Wide>(
+            &context,
+            &event_files,
+            &click_files,
+            &links,
+            &users,
+            &campaigns,
+        )
+    }
+}
+
+fn run<'a, P: rollup::Payload>(
+    context: &rollup::Context<'a>,
+    event_files: &'a [memmap2::Mmap],
+    click_files: &'a [memmap2::Mmap],
+    links: &'a [memmap2::Mmap],
+    users: &std::path::Path,
+    campaigns: &std::path::Path,
+) -> Result<()> {
+    let dimensions = context.dimensions;
+    let names = context.names;
     let (aliases, pending) = rayon::join(
-        || stage("resolve linked IDs", || input::aliases(&links, &names)),
-        || stage("parse events", || context.read_events(&event_files)),
+        || stage("resolve linked IDs", || input::aliases(links, names)),
+        || stage("parse events", || context.read_events::<P>(event_files)),
     );
     let (events, clicks) = rayon::join(
         || {
@@ -70,23 +103,34 @@ fn main() -> Result<()> {
         },
         || {
             stage("read and validate clicks", || {
-                context.clicks(&click_files, &aliases)
+                context.clicks(click_files, &aliases)
             })
         },
     );
     let parquet = output::Parquet::new()?;
     let partials: Result<Vec<_>> = stage("sessionise, attribute and write users", || {
-        events
+        let groups: Vec<_> = events.into_iter().zip(clicks).collect();
+        groups
             .into_par_iter()
-            .zip(clicks)
+            .chunks(rollup::USER_GROUPS / input::PARTITIONS)
             .enumerate()
-            .map(|(partition, (events, clicks))| {
-                let (rows, days) =
-                    rollup::aggregate(input::merge(events), input::merge(clicks), &dimensions);
+            .map(|(partition, groups)| {
+                let mut rows = Vec::new();
+                let mut days = rollup::CampaignDays::new();
+                for (events, clicks) in groups {
+                    rollup::aggregate(
+                        input::merge(events),
+                        context.start,
+                        input::merge(clicks),
+                        dimensions,
+                        &mut rows,
+                        &mut days,
+                    );
+                }
                 if partition == 0 || !rows.is_empty() {
                     parquet.users(
                         &rows,
-                        &names,
+                        names,
                         &users.join(format!("part-{partition:03}.parquet")),
                     )?;
                 }
