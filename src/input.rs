@@ -126,6 +126,21 @@ fn digit(byte: u8) -> Option<u32> {
 
 #[inline]
 pub fn number(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() == 13 {
+        let digits = u64::from_le_bytes(bytes[5..].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+        if digits & 0xf0f0_f0f0_f0f0_f0f0 != 0
+            || (digits + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010 != 0
+        {
+            return None;
+        }
+        let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8) & 0x00ff_00ff_00ff_00ff;
+        let quads = pairs.wrapping_mul(100).wrapping_add(pairs >> 16) & 0x0000_ffff_0000_ffff;
+        let mut head = 0;
+        for &byte in &bytes[..5] {
+            head = head * 10 + u64::from(digit(byte)?);
+        }
+        return Some(head * 100_000_000 + (quads & 65535) * 10_000 + (quads >> 32));
+    }
     if bytes.is_empty() {
         return None;
     }
@@ -150,7 +165,78 @@ fn pair(bytes: &[u8], start: usize) -> Option<u32> {
     Some(digit(bytes[start])? * 10 + digit(bytes[start + 1])?)
 }
 
-#[inline]
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+static MONTHS: [[i32; 13]; 10000] = {
+    let mut years = [[0; 13]; 10000];
+    let mut base = -719528;
+    let mut year = 0;
+    while year < 10000 {
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let lengths = [31, 28 + leap as i32, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let mut m = 0;
+        while m < 12 {
+            years[year][m] = base;
+            base += lengths[m];
+            m += 1;
+        }
+        years[year][12] = base;
+        year += 1;
+    }
+    years
+};
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+fn ascii_calendar(bytes: &[u8]) -> Option<i64> {
+    use core::arch::x86_64::*;
+    // The caller has established a full 20- or 25-byte timestamp.
+    unsafe {
+        let a = _mm_loadu_si128(bytes.as_ptr().cast());
+        let b = _mm_loadu_si128(bytes.as_ptr().add(3).cast());
+        let marks = _mm_setr_epi8(
+            0, 0, 0, 0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0,
+        );
+        let select = _mm_setr_epi8(0, 0, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0);
+        if _mm_testz_si128(_mm_xor_si128(a, marks), select) == 0 || bytes[16] != b':' {
+            return None;
+        }
+        let a = _mm_sub_epi8(a, _mm_set1_epi8(b'0' as i8));
+        let b = _mm_sub_epi8(b, _mm_set1_epi8(b'0' as i8));
+        let leading = _mm_shuffle_epi8(
+            a,
+            _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1),
+        );
+        let seconds = _mm_shuffle_epi8(
+            b,
+            _mm_setr_epi8(
+                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 14, 15, -1, -1,
+            ),
+        );
+        let digits = _mm_or_si128(leading, seconds);
+        let invalid = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        let limits = _mm_setr_epi16(99, 99, 12, 31, 23, 59, 59, 0);
+        let bad = _mm_or_si128(invalid, _mm_cmpgt_epi16(pairs, limits));
+        if _mm_testz_si128(bad, bad) == 0 {
+            return None;
+        }
+        let scaled = _mm_madd_epi16(pairs, _mm_setr_epi16(100, 1, 0, 0, 3600, 60, 0, 0));
+        let year = _mm_cvtsi128_si32(scaled) as usize;
+        let month = _mm_extract_epi16::<2>(pairs) as usize;
+        let day = _mm_extract_epi16::<3>(pairs);
+        if month == 0 || day == 0 {
+            return None;
+        }
+        let year = &MONTHS[year];
+        let begin = year[month - 1];
+        if day > year[month] - begin {
+            return None;
+        }
+        let seconds = _mm_extract_epi32::<2>(scaled) + _mm_extract_epi16::<6>(pairs);
+        Some(i64::from(begin + day - 1) * DAY + i64::from(seconds) * 1000)
+    }
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 fn ascii_calendar(bytes: &[u8]) -> Option<i64> {
     if bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
         return None;
