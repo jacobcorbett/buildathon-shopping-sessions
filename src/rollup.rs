@@ -202,6 +202,40 @@ pub struct PendingEvent<P> {
     event: Event<P>,
 }
 
+#[derive(Clone, Copy)]
+// The high bit selects an exact overflow record. Common records store a 31-bit
+// person handle and a signed 32-bit millisecond offset from the window start.
+pub struct Routed<P> {
+    id: Key,
+    stamp: u64,
+    payload: P,
+}
+pub struct RoutedEvents<P> {
+    rows: Vec<Shards<Routed<P>>>,
+    overflow: Vec<(Key, i64)>,
+}
+impl<P: Copy> Routed<P> {
+    fn person(self, spill: &[(Key, i64)]) -> Key {
+        if self.stamp >> 63 == 0 {
+            self.stamp >> 32
+        } else {
+            spill[(self.stamp & i64::MAX as u64) as usize].0
+        }
+    }
+    fn event(self, spill: &[(Key, i64)]) -> Event<P> {
+        Event {
+            person: self.person(spill),
+            payload: self.payload,
+        }
+    }
+    fn ingest(self, origin: i64, spill: &[(Key, i64)]) -> i64 {
+        if self.stamp >> 63 == 0 {
+            origin.wrapping_add(self.stamp as i32 as i64)
+        } else {
+            spill[(self.stamp & i64::MAX as u64) as usize].1
+        }
+    }
+}
 pub trait ClickData: Copy + Send + Sync + Default {
     fn new(id: Key, time: i64, campaign: usize, origin: i64) -> Self;
     fn id(self) -> Key;
@@ -331,8 +365,9 @@ impl<'a> Context<'a> {
         ))
     }
 
-    pub fn read_events<P: Payload>(&self, files: &[Mmap]) -> Vec<Shards<PendingEvent<P>>> {
-        input::route(
+    pub fn read_events<P: Payload>(&self, files: &[Mmap]) -> RoutedEvents<P> {
+        let spill = std::sync::Mutex::new(Vec::new());
+        let rows = input::route(
             files,
             self.workers,
             72,
@@ -349,15 +384,38 @@ impl<'a> Context<'a> {
                     *part %= ID_PARTS;
                 }
             },
-        )
+            |item| {
+                let person = item.event.person;
+                let delta = item.ingest.wrapping_sub(self.start);
+                let stamp = if person < (1 << 31) && delta == delta as i32 as i64 {
+                    (person << 32) | u64::from(delta as u32)
+                } else {
+                    let mut spill = spill.lock().unwrap();
+                    let index = spill.len();
+                    spill.push((person, item.ingest));
+                    (1 << 63) | index as u64
+                };
+                Routed {
+                    id: item.id,
+                    stamp,
+                    payload: item.event.payload,
+                }
+            },
+        );
+        RoutedEvents {
+            rows,
+            overflow: spill.into_inner().unwrap(),
+        }
     }
 
     pub fn deduplicate_events<P: Payload>(
         &self,
-        by_id: Vec<Shards<PendingEvent<P>>>,
+        routed: RoutedEvents<P>,
         aliases: &input::Aliases,
     ) -> Vec<Vec<EventShard<P>>> {
-        let by_person: Vec<Vec<EventShard<P>>> = by_id
+        let spill = &routed.overflow;
+        let by_person: Vec<Vec<EventShard<P>>> = routed
+            .rows
             .into_par_iter()
             .chunks(ID_PARTS / PARTITIONS)
             .map(|buckets| {
@@ -396,12 +454,12 @@ impl<'a> Context<'a> {
                     for chunk in &chunks {
                         for batch in chunk.chunks(32) {
                             for item in batch {
-                                aliases.prefetch(item.event.person.wrapping_sub(1));
+                                aliases.prefetch(item.person(spill).wrapping_sub(1));
                             }
                             for item in batch {
                                 let (i, mask) = position(item.id);
                                 if repeated[i] & mask != mask {
-                                    emit(item.event);
+                                    emit(item.event(spill));
                                 } else {
                                     use std::collections::hash_map::Entry;
                                     match winners.entry(item.id) {
@@ -409,7 +467,9 @@ impl<'a> Context<'a> {
                                             e.insert(item);
                                         }
                                         Entry::Occupied(mut e) => {
-                                            if item.ingest < e.get().ingest {
+                                            if item.ingest(self.start, spill)
+                                                < e.get().ingest(self.start, spill)
+                                            {
                                                 e.insert(item);
                                             }
                                         }
@@ -419,7 +479,7 @@ impl<'a> Context<'a> {
                         }
                     }
                     for winner in winners.into_values() {
-                        emit(winner.event);
+                        emit(winner.event(spill));
                     }
                 }
                 shards
@@ -478,6 +538,7 @@ impl<'a> Context<'a> {
                     *part = person_group(click.person);
                 }
             },
+            |click| click,
         )
     }
 }

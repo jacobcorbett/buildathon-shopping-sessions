@@ -502,14 +502,15 @@ pub fn transpose<T>(parts: Vec<Shards<T>>, count: usize) -> Vec<Shards<T>> {
     grouped
 }
 
-pub fn route<'a, T: Send>(
+pub fn route<'a, T: Send, U: Send>(
     files: &'a [Mmap],
     workers: usize,
     bytes_per_row: usize,
     partitions: usize,
     parse: impl Fn(&'a [u8]) -> Option<(usize, T)> + Sync,
     prepare: impl Fn(&mut [(usize, T)]) + Sync,
-) -> Vec<Shards<T>> {
+    store: impl Fn(T) -> U + Sync,
+) -> Vec<Shards<U>> {
     let chunks = chunks(files);
     let groups = (workers * 4).min(chunks.len()).max(1);
     // Interleave chunks to spread long and short files across workers.
@@ -518,14 +519,14 @@ pub fn route<'a, T: Send>(
         .map(|index| {
             let assigned = chunks.iter().skip(index).step_by(groups);
             let bytes: usize = assigned.clone().map(|chunk| chunk.len()).sum();
-            let mut shards: Shards<T> = (0..partitions)
+            let mut shards: Shards<U> = (0..partitions)
                 .map(|_| Vec::with_capacity(bytes / bytes_per_row / partitions))
                 .collect();
             let mut batch = Vec::with_capacity(64);
             let mut flush = |batch: &mut Vec<(usize, T)>| {
                 prepare(batch);
                 for (partition, item) in batch.drain(..) {
-                    shards[partition].push(item);
+                    shards[partition].push(store(item));
                 }
             };
             for chunk in assigned {
