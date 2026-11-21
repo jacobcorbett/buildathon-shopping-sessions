@@ -253,18 +253,20 @@ fn digit(byte: u8) -> Option<u32> {
 #[inline]
 pub fn number(bytes: &[u8]) -> Option<u64> {
     if bytes.len() == 13 {
-        let digits = u64::from_le_bytes(bytes[5..].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
-        if digits & 0xf0f0_f0f0_f0f0_f0f0 != 0
-            || (digits + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010 != 0
-        {
+        // The two overlapping loads cover all thirteen bytes without reading past the slice.
+        let first = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let last = u64::from_le_bytes(bytes[5..].try_into().unwrap());
+        let non_digit =
+            |x: u64| x.wrapping_add(0x4646_4646_4646_4646) | x.wrapping_sub(0x3030_3030_3030_3030);
+        if (non_digit(first) | non_digit(last)) & 0x8080_8080_8080_8080 != 0 {
             return None;
         }
+        let head_digits = ((first >> 8) as u32) & 0x0f0f_0f0f;
+        let head_pairs = (head_digits.wrapping_mul(10) + (head_digits >> 8)) & 0x00ff_00ff;
+        let head = (first & 15) * 10000 + u64::from((head_pairs & 255) * 100 + (head_pairs >> 16));
+        let digits = last & 0x0f0f_0f0f_0f0f_0f0f;
         let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8) & 0x00ff_00ff_00ff_00ff;
         let quads = pairs.wrapping_mul(100).wrapping_add(pairs >> 16) & 0x0000_ffff_0000_ffff;
-        let mut head = 0;
-        for &byte in &bytes[..5] {
-            head = head * 10 + u64::from(digit(byte)?);
-        }
         return Some(head * 100_000_000 + (quads & 65535) * 10_000 + (quads >> 32));
     }
     if bytes.is_empty() {
