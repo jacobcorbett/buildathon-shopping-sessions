@@ -4,7 +4,7 @@ use ahash::{AHashMap, RandomState};
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-pub const USER_GROUPS: usize = PARTITIONS * 8;
+pub const USER_GROUPS: usize = PARTITIONS * 2;
 const INVALID_TIME: i64 = i64::MIN;
 const SESSION_GAP: i64 = 1_800_000;
 
@@ -528,13 +528,10 @@ fn sessionise<'a, P: Payload>(
     category_totals.fill(0);
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct Group {
-    person: Key,
-    n_events: usize,
-    n_clicks: usize,
-    event_end: usize,
-    click_end: usize,
+    events: usize,
+    clicks: usize,
 }
 
 pub fn aggregate<'a, P: Payload>(
@@ -551,53 +548,34 @@ pub fn aggregate<'a, P: Payload>(
     if count == 0 {
         return;
     }
-    let mut groups: Vec<Group> = Vec::new();
-    // All handles in a shard share their low bits. The quotient directly
-    // indexes each person without a second hash or a comparison sort.
-    let mut lookup = vec![usize::MAX; people.direct_len().div_ceil(USER_GROUPS)];
-    let mut event_groups = Vec::with_capacity(count);
+    // All handles in a shard share their low bits. Count directly by the
+    // remaining bits, then reuse the counts as backwards scatter cursors.
+    let residue = events.iter().flatten().next().unwrap().person as usize % USER_GROUPS;
+    let mut groups = vec![Group::default(); people.direct_len().div_ceil(USER_GROUPS)];
     for event in events.iter().flatten() {
         let slot = event.person as usize / USER_GROUPS;
-        if slot >= lookup.len() {
-            lookup.resize(slot + 1, usize::MAX);
+        if slot >= groups.len() {
+            groups.resize(slot + 1, Group::default());
         }
-        let id = if lookup[slot] != usize::MAX {
-            lookup[slot]
-        } else {
-            let id = groups.len();
-            groups.push(Group {
-                person: people.key(event.person),
-                ..Group::default()
-            });
-            lookup[slot] = id;
-            id
-        };
-        groups[id].n_events += 1;
-        event_groups.push(id);
+        groups[slot].events += 1;
     }
-    let mut click_groups = Vec::new();
     for click in clicks.iter().flatten() {
-        let id = lookup
-            .get(click.person as usize / USER_GROUPS)
-            .copied()
-            .filter(|&id| id != usize::MAX);
-        if let Some(i) = id {
-            groups[i].n_clicks += 1;
+        if let Some(group) = groups.get_mut(click.person as usize / USER_GROUPS) {
+            group.clicks += 1;
         }
-        click_groups.push(id.unwrap_or(usize::MAX));
     }
     let (mut event_offset, mut click_offset) = (0, 0);
     for group in &mut groups {
-        group.event_end = event_offset;
-        event_offset += group.n_events;
-        group.click_end = click_offset;
-        click_offset += group.n_clicks;
+        event_offset += group.events;
+        group.events = event_offset;
+        click_offset += group.clicks;
+        group.clicks = click_offset;
     }
     let mut sorted_events = vec![P::encode(origin, 0, 0, origin); event_offset];
-    for (event, id) in events.into_iter().flatten().zip(event_groups) {
-        let end = &mut groups[id].event_end;
-        sorted_events[*end] = event.payload;
-        *end += 1;
+    for event in events.into_iter().flatten() {
+        let group = &mut groups[event.person as usize / USER_GROUPS];
+        group.events -= 1;
+        sorted_events[group.events] = event.payload;
     }
     let mut sorted_clicks = vec![
         Click {
@@ -608,23 +586,30 @@ pub fn aggregate<'a, P: Payload>(
         };
         click_offset
     ];
-    for (click, id) in clicks.into_iter().flatten().zip(click_groups) {
-        if id != usize::MAX {
-            let end = &mut groups[id].click_end;
-            sorted_clicks[*end] = click;
-            *end += 1;
+    for click in clicks.into_iter().flatten() {
+        if let Some(group) = groups.get_mut(click.person as usize / USER_GROUPS) {
+            group.clicks -= 1;
+            sorted_clicks[group.clicks] = click;
         }
     }
+    groups.push(Group {
+        events: event_offset,
+        clicks: click_offset,
+    });
     let mut sessions = Vec::new();
     let mut totals = vec![0; dimensions.categories.len()];
     let mut attribution = Attribution::new(dimensions.campaigns.len());
-    for group in groups {
-        let events = &mut sorted_events[group.event_end - group.n_events..group.event_end];
-        let clicks = &mut sorted_clicks[group.click_end - group.n_clicks..group.click_end];
+    for (slot, pair) in groups.windows(2).enumerate() {
+        if pair[0].events == pair[1].events {
+            continue;
+        }
+        let person = people.key((slot * USER_GROUPS + residue) as Key);
+        let events = &mut sorted_events[pair[0].events..pair[1].events];
+        let clicks = &mut sorted_clicks[pair[0].clicks..pair[1].clicks];
         P::sort(events);
         clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| names.compare(b.id, a.id)));
         sessionise(
-            group.person,
+            person,
             events,
             origin,
             &dimensions.categories,
