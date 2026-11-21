@@ -65,7 +65,7 @@ fn main() -> Result<()> {
         workers,
         dimensions: &dimensions,
         names: &names,
-        hash: RandomState::new(),
+        salt: RandomState::new().hash_one(0u64),
     };
     if context.end.abs_diff(context.start) <= u64::from(u32::MAX)
         && dimensions.categories.len() <= 256

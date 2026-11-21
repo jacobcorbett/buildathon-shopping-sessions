@@ -1,6 +1,6 @@
 use crate::ids::{Key, Names};
 use crate::input::{self, DAY, Id, PARTITIONS, Shards, WEEK};
-use ahash::{AHashMap, RandomState};
+use ahash::AHashMap;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
@@ -138,13 +138,13 @@ pub struct Context<'a> {
     pub workers: usize,
     pub dimensions: &'a Dimensions<'a>,
     pub names: &'a Names,
-    pub hash: RandomState,
+    pub salt: Key,
 }
 
 impl<'a> Context<'a> {
     #[inline]
     fn partition(&self, id: Key) -> usize {
-        self.hash.hash_one(id) as usize & (PARTITIONS - 1)
+        id as usize & (PARTITIONS - 1)
     }
 
     #[inline(always)]
@@ -194,7 +194,11 @@ impl<'a> Context<'a> {
             },
             payload: P::encode(data.time, data.price, data.category, self.start),
         };
-        let id = self.names.key(id);
+        // A reversible permutation retains exact identity; its bits select
+        // a routing partition, filter word and fingerprints.
+        let id = (self.names.key(id) ^ self.salt)
+            .wrapping_mul(0x9e3779b97f4a7c15)
+            .swap_bytes();
         let hint = self.people.hint(event.person);
         Some((
             hint * PARTITIONS + self.partition(id),
@@ -232,18 +236,23 @@ impl<'a> Context<'a> {
             .into_par_iter()
             .map(|chunks| {
                 let capacity: usize = chunks.iter().map(Vec::len).sum();
-                // Two bitmaps identify hash slots hit more than once. Only
-                // those records need the exact-key table and ingest comparison.
-                let slots = (capacity * 8 + 1).next_power_of_two().max(64);
-                let mask = slots - 1;
-                let mut seen = vec![0u64; slots / 64];
-                let mut repeated = vec![0u64; slots / 64];
-                let slot = |key| (self.hash.hash_one(key) as usize / PARTITIONS) & mask;
+                let words = (capacity * 8 + 1).next_power_of_two().div_ceil(64);
+                let mut seen = vec![0u64; words];
+                let mut repeated = vec![0u64; words];
+                let position = |key: Key| {
+                    let word = (key as usize / PARTITIONS) & (words - 1);
+                    let mask = (1u64 << ((key >> 35) & 63))
+                        | (1u64 << ((key >> 48) & 63))
+                        | (1u64 << ((key >> 57) & 63));
+                    (word, mask)
+                };
                 for item in chunks.iter().flatten() {
-                    let pos = slot(item.id);
-                    let bit = 1u64 << (pos % 64);
-                    repeated[pos / 64] |= seen[pos / 64] & bit;
-                    seen[pos / 64] |= bit;
+                    let (i, mask) = position(item.id);
+                    let prior = seen[i];
+                    if prior & mask == mask {
+                        repeated[i] |= mask;
+                    }
+                    seen[i] = prior | mask;
                 }
                 let mut shards: Shards<Event<P>> = (0..USER_GROUPS)
                     .map(|_| Vec::with_capacity(capacity / USER_GROUPS))
@@ -261,8 +270,8 @@ impl<'a> Context<'a> {
                             aliases.prefetch(item.event.person.wrapping_sub(1));
                         }
                         for item in batch {
-                            let pos = slot(item.id);
-                            if repeated[pos / 64] & (1u64 << (pos % 64)) == 0 {
+                            let (i, mask) = position(item.id);
+                            if repeated[i] & mask != mask {
                                 emit(item.event);
                             } else {
                                 use std::collections::hash_map::Entry;
