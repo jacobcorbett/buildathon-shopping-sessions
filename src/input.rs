@@ -78,12 +78,13 @@ fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
         right &= right - 1;
     }
     let mut row = [&[][..]; 7];
-    let mut start = 0;
+    let mut start = 0usize;
     let mut stripped = 0;
     for (field, end) in row.iter_mut().zip(ends) {
-        let raw = &line[start..end];
-        let trim = usize::from(raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"');
-        *field = &raw[trim..raw.len() - trim];
+        let open = line[start.min(len - 1)] == b'"';
+        let close = line[end.saturating_sub(1)] == b'"';
+        let trim = usize::from((end - start >= 2) & open & close);
+        *field = &line[start + trim..end - trim];
         start = end + 1;
         stripped += 2 * trim as u32;
     }
@@ -104,7 +105,11 @@ pub fn event_row(line: &[u8]) -> Option<[&[u8]; 7]> {
 #[inline(always)]
 pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if (32..=128).contains(&line.len()) {
+    if (32..=64).contains(&line.len()) {
+        return short_fields(line);
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if (65..=128).contains(&line.len()) {
         return masked_fields(line);
     }
     scalar_fields(line)
@@ -136,6 +141,45 @@ fn scalar_fields<const N: usize>(mut line: &[u8]) -> Option<[&[u8]; N]> {
         *field = value;
     }
     Some(result)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn short_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    use core::arch::x86_64::*;
+    let len = line.len();
+    let offset = len - 32;
+    let (mut commas, quotes) = unsafe {
+        let a = _mm256_loadu_si256(line.as_ptr().cast());
+        let b = _mm256_loadu_si256(line.as_ptr().add(offset).cast());
+        let mask = |c| {
+            let c = _mm256_set1_epi8(c);
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, c)) as u32 as u64
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, c)) as u32 as u64) << offset)
+        };
+        (mask(b',' as i8), mask(b'"' as i8).count_ones())
+    };
+    if commas.count_ones() as usize != N - 1 {
+        return None;
+    }
+    let mut row = [&[][..]; N];
+    let mut start = 0usize;
+    let mut stripped = 0;
+    for (i, field) in row.iter_mut().enumerate() {
+        let end = if i == N - 1 {
+            len
+        } else {
+            commas.trailing_zeros() as usize
+        };
+        commas &= commas.wrapping_sub(1);
+        let open = line[start.min(len - 1)] == b'"';
+        let close = line[end.saturating_sub(1)] == b'"';
+        let trim = usize::from((end - start >= 2) & open & close);
+        *field = &line[start + trim..end - trim];
+        start = end + 1;
+        stripped += 2 * trim as u32;
+    }
+    (stripped == quotes).then_some(row)
 }
 
 // Read overlapping vectors at the tail so every load stays within the line.
