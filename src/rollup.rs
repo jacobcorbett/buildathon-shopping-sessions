@@ -55,6 +55,8 @@ impl<'a> Dimensions<'a> {
 }
 
 pub trait Payload: Copy + Send + Sync {
+    // True when every validated event has an unsigned 32-bit offset from the window start.
+    const COMPACT_TIME: bool;
     type Click: ClickData;
     fn encode(time: i64, price: u32, category: u32, origin: i64) -> Self;
     fn sort(items: &mut [Self]);
@@ -71,6 +73,7 @@ pub struct Wide {
 }
 
 impl Payload for Wide {
+    const COMPACT_TIME: bool = false;
     type Click = WideClick;
     fn sort(items: &mut [Self]) {
         items.sort_unstable_by_key(|item| item.time);
@@ -96,6 +99,7 @@ impl Payload for Wide {
 // The caller checks the window and category count. Valid prices fit in
 // 24 bits by the track rules. Invalid records have a zero person key.
 impl Payload for u64 {
+    const COMPACT_TIME: bool = true;
     type Click = CompactClick;
     fn sort(items: &mut [Self]) {
         items.sort_unstable();
@@ -118,6 +122,62 @@ impl Payload for u64 {
 pub struct Event<P> {
     person: Key,
     payload: P,
+}
+
+// Grouped, deduplicated events awaiting the per-person scatter.
+// Purchases and large handles retain their full payload in the exact array.
+pub struct EventShard<P> {
+    rows: Vec<u64>,
+    exact: Vec<Event<P>>,
+}
+impl<P: Payload> EventShard<P> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            rows: Vec::with_capacity(if P::COMPACT_TIME { capacity } else { 0 }),
+            exact: Vec::with_capacity(if P::COMPACT_TIME {
+                capacity / 24
+            } else {
+                capacity
+            }),
+        }
+    }
+    fn len(&self) -> usize {
+        self.rows.len() + self.exact.len()
+    }
+    #[inline(always)]
+    fn push(&mut self, event: Event<P>, origin: i64) {
+        if P::COMPACT_TIME && event.person <= Key::from(u32::MAX) && event.payload.price() == 0 {
+            let elapsed = event.payload.time(origin).wrapping_sub(origin) as u32;
+            self.rows.push((event.person << 32) | u64::from(elapsed));
+        } else {
+            self.exact.push(event);
+        }
+    }
+    fn first(&self) -> Option<Key> {
+        self.rows
+            .first()
+            .map(|r| r >> 32)
+            .or_else(|| self.exact.first().map(|e| e.person))
+    }
+    fn people(&self, mut visit: impl FnMut(Key)) {
+        for &row in &self.rows {
+            visit(row >> 32);
+        }
+        for event in &self.exact {
+            visit(event.person);
+        }
+    }
+    fn unpack(self, origin: i64, mut visit: impl FnMut(Event<P>)) {
+        for row in self.rows {
+            visit(Event {
+                person: row >> 32,
+                payload: P::encode(origin + i64::from(row as u32), 0, 0, origin),
+            });
+        }
+        for event in self.exact {
+            visit(event);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -281,19 +341,19 @@ impl<'a> Context<'a> {
         &self,
         by_id: Vec<Shards<PendingEvent<P>>>,
         aliases: &input::Aliases,
-    ) -> Vec<Shards<Event<P>>> {
-        let by_person = by_id
+    ) -> Vec<Vec<EventShard<P>>> {
+        let by_person: Vec<Vec<EventShard<P>>> = by_id
             .into_par_iter()
             .chunks(ID_PARTS / PARTITIONS)
             .map(|buckets| {
                 let capacity: usize = buckets.iter().flatten().map(Vec::len).sum();
-                let mut shards: Shards<Event<P>> = (0..USER_GROUPS)
-                    .map(|_| Vec::with_capacity(capacity / USER_GROUPS))
+                let mut shards: Vec<EventShard<P>> = (0..USER_GROUPS)
+                    .map(|_| EventShard::new(capacity / USER_GROUPS))
                     .collect();
                 let mut emit = |mut event: Event<P>| {
                     if event.person != 0 {
                         event.person = aliases.person(event.person - 1);
-                        shards[event.person as usize % USER_GROUPS].push(event);
+                        shards[event.person as usize % USER_GROUPS].push(event, self.start);
                     }
                 };
                 for chunks in buckets {
@@ -350,7 +410,15 @@ impl<'a> Context<'a> {
                 shards
             })
             .collect();
-        input::transpose(by_person, USER_GROUPS)
+        let mut output = input::buckets(USER_GROUPS);
+        for task in by_person {
+            for (i, part) in task.into_iter().enumerate() {
+                if part.len() != 0 {
+                    output[i].push(part);
+                }
+            }
+        }
+        output
     }
 
     pub fn clicks<C: ClickData>(
@@ -613,7 +681,7 @@ struct Group {
 }
 
 pub fn aggregate<'a, P: Payload>(
-    events: Shards<Event<P>>,
+    events: Vec<EventShard<P>>,
     origin: i64,
     clicks: Shards<Click<P::Click>>,
     dimensions: &Dimensions<'a>,
@@ -622,20 +690,22 @@ pub fn aggregate<'a, P: Payload>(
     rows: &mut Vec<UserRow<'a>>,
     days: &mut CampaignDays,
 ) {
-    let count: usize = events.iter().map(Vec::len).sum();
+    let count: usize = events.iter().map(EventShard::len).sum();
     if count == 0 {
         return;
     }
     // All handles in a shard share their low bits. Count directly by the
     // remaining bits, then reuse the counts as backwards scatter cursors.
-    let residue = events.iter().flatten().next().unwrap().person as usize % USER_GROUPS;
+    let residue = events.iter().find_map(EventShard::first).unwrap() as usize % USER_GROUPS;
     let mut groups = vec![Group::default(); people.direct_len().div_ceil(USER_GROUPS)];
-    for event in events.iter().flatten() {
-        let slot = event.person as usize / USER_GROUPS;
-        if slot >= groups.len() {
-            groups.resize(slot + 1, Group::default());
-        }
-        groups[slot].events += 1;
+    for part in &events {
+        part.people(|person| {
+            let slot = person as usize / USER_GROUPS;
+            if slot >= groups.len() {
+                groups.resize(slot + 1, Group::default());
+            }
+            groups[slot].events += 1;
+        });
     }
     for click in clicks.iter().flatten() {
         if let Some(group) = groups.get_mut(click.person as usize / USER_GROUPS) {
@@ -650,10 +720,12 @@ pub fn aggregate<'a, P: Payload>(
         group.clicks = click_offset;
     }
     let mut sorted_events = vec![P::encode(origin, 0, 0, origin); event_offset];
-    for event in events.into_iter().flatten() {
-        let group = &mut groups[event.person as usize / USER_GROUPS];
-        group.events -= 1;
-        sorted_events[group.events] = event.payload;
+    for part in events {
+        part.unpack(origin, |event| {
+            let group = &mut groups[event.person as usize / USER_GROUPS];
+            group.events -= 1;
+            sorted_events[group.events] = event.payload;
+        });
     }
     let mut sorted_clicks = vec![P::Click::default(); click_offset];
     for click in clicks.into_iter().flatten() {
