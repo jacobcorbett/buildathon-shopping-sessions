@@ -54,6 +54,7 @@ impl<'a> Dimensions<'a> {
 }
 
 pub trait Payload: Copy + Send + Sync {
+    type Click: ClickData;
     fn encode(time: i64, price: u32, category: u32, origin: i64) -> Self;
     fn sort(items: &mut [Self]);
     fn time(self, origin: i64) -> i64;
@@ -69,6 +70,7 @@ pub struct Wide {
 }
 
 impl Payload for Wide {
+    type Click = WideClick;
     fn sort(items: &mut [Self]) {
         items.sort_unstable_by_key(|item| item.time);
     }
@@ -93,6 +95,7 @@ impl Payload for Wide {
 // The caller checks the window and category count. Valid prices fit in
 // 24 bits by the track rules. Invalid records have a zero person key.
 impl Payload for u64 {
+    type Click = CompactClick;
     fn sort(items: &mut [Self]) {
         items.sort_unstable();
     }
@@ -123,12 +126,58 @@ pub struct PendingEvent<P> {
     event: Event<P>,
 }
 
-#[derive(Clone, Copy)]
-pub struct Click {
-    person: Key,
-    time: i64,
+pub trait ClickData: Copy + Send + Sync + Default {
+    fn new(id: Key, time: i64, campaign: usize, origin: i64) -> Self;
+    fn id(self) -> Key;
+    fn time(self, origin: i64) -> i64;
+    fn campaign(self) -> usize;
+}
+#[derive(Clone, Copy, Default)]
+pub struct WideClick {
     id: Key,
+    time: i64,
     campaign: usize,
+}
+impl ClickData for WideClick {
+    fn new(id: Key, time: i64, campaign: usize, _: i64) -> Self {
+        Self { id, time, campaign }
+    }
+    fn id(self) -> Key {
+        self.id
+    }
+    fn time(self, _: i64) -> i64 {
+        self.time
+    }
+    fn campaign(self) -> usize {
+        self.campaign
+    }
+}
+#[derive(Clone, Copy, Default)]
+pub struct CompactClick {
+    id: Key,
+    stamp: u64,
+}
+impl ClickData for CompactClick {
+    fn new(id: Key, time: i64, campaign: usize, origin: i64) -> Self {
+        Self {
+            id,
+            stamp: (((time - origin) as u64) << 32) | campaign as u64,
+        }
+    }
+    fn id(self) -> Key {
+        self.id
+    }
+    fn time(self, origin: i64) -> i64 {
+        origin + (self.stamp >> 32) as i64
+    }
+    fn campaign(self) -> usize {
+        self.stamp as u32 as usize
+    }
+}
+#[derive(Clone, Copy)]
+pub struct Click<C: ClickData> {
+    person: Key,
+    data: C,
 }
 
 pub struct Context<'a> {
@@ -298,7 +347,11 @@ impl<'a> Context<'a> {
         input::transpose(by_person, USER_GROUPS)
     }
 
-    pub fn clicks(&self, files: &[Mmap], aliases: &input::Aliases) -> Vec<Shards<Click>> {
+    pub fn clicks<C: ClickData>(
+        &self,
+        files: &[Mmap],
+        aliases: &input::Aliases,
+    ) -> Vec<Shards<Click<C>>> {
         input::route(
             files,
             self.workers,
@@ -322,9 +375,7 @@ impl<'a> Context<'a> {
                     self.people.hint(person),
                     Click {
                         person,
-                        time,
-                        id: self.names.key(id),
-                        campaign,
+                        data: C::new(self.names.key(id), time, campaign, self.start - WEEK),
                     },
                 ))
             },
@@ -400,7 +451,13 @@ impl Attribution {
         }
     }
 
-    fn attribute(&mut self, sessions: &[Session], clicks: &[Click], days: &mut CampaignDays) {
+    fn attribute<C: ClickData>(
+        &mut self,
+        sessions: &[Session],
+        clicks: &[C],
+        days: &mut CampaignDays,
+        origin: i64,
+    ) {
         let mut lower = 0;
         let mut upper = 0;
         let campaign_count = self.states.len();
@@ -421,8 +478,8 @@ impl Attribution {
             }
             // Add first, then expire. A campaign that loses an old click and
             // gains a new one between sessions can remain continuously active.
-            while upper < clicks.len() && clicks[upper].time <= session.start {
-                let campaign = clicks[upper].campaign;
+            while upper < clicks.len() && clicks[upper].time(origin) <= session.start {
+                let campaign = clicks[upper].campaign();
                 let state = &mut self.states[campaign];
                 if state.clicks == 0 {
                     state.active_since = index;
@@ -432,8 +489,8 @@ impl Attribution {
                 state.clicks += 1;
                 upper += 1;
             }
-            while lower < upper && clicks[lower].time < session.start - WEEK {
-                let campaign = clicks[lower].campaign;
+            while lower < upper && clicks[lower].time(origin) < session.start - WEEK {
+                let campaign = clicks[lower].campaign();
                 let state = &mut self.states[campaign];
                 state.clicks -= 1;
                 if state.clicks == 0 {
@@ -447,7 +504,7 @@ impl Attribution {
                 lower += 1;
             }
             let winner = if lower < upper {
-                clicks[upper - 1].campaign
+                clicks[upper - 1].campaign()
             } else {
                 0
             };
@@ -552,7 +609,7 @@ struct Group {
 pub fn aggregate<'a, P: Payload>(
     events: Shards<Event<P>>,
     origin: i64,
-    clicks: Shards<Click>,
+    clicks: Shards<Click<P::Click>>,
     dimensions: &Dimensions<'a>,
     people: &input::People,
     names: &Names,
@@ -592,19 +649,11 @@ pub fn aggregate<'a, P: Payload>(
         group.events -= 1;
         sorted_events[group.events] = event.payload;
     }
-    let mut sorted_clicks = vec![
-        Click {
-            person: 0,
-            time: 0,
-            id: 0,
-            campaign: 0
-        };
-        click_offset
-    ];
+    let mut sorted_clicks = vec![P::Click::default(); click_offset];
     for click in clicks.into_iter().flatten() {
         if let Some(group) = groups.get_mut(click.person as usize / USER_GROUPS) {
             group.clicks -= 1;
-            sorted_clicks[group.clicks] = click;
+            sorted_clicks[group.clicks] = click.data;
         }
     }
     groups.push(Group {
@@ -622,7 +671,11 @@ pub fn aggregate<'a, P: Payload>(
         let events = &mut sorted_events[pair[0].events..pair[1].events];
         let clicks = &mut sorted_clicks[pair[0].clicks..pair[1].clicks];
         P::sort(events);
-        clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| names.compare(b.id, a.id)));
+        clicks.sort_unstable_by(|a, b| {
+            a.time(origin - WEEK)
+                .cmp(&b.time(origin - WEEK))
+                .then_with(|| names.compare(b.id(), a.id()))
+        });
         sessionise(
             person,
             events,
@@ -632,7 +685,7 @@ pub fn aggregate<'a, P: Payload>(
             &mut sessions,
             rows,
         );
-        attribution.attribute(&sessions, clicks, days);
+        attribution.attribute(&sessions, clicks, days, origin - WEEK);
         sessions.clear();
     }
 }

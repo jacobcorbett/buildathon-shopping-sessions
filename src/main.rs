@@ -67,7 +67,9 @@ fn main() -> Result<()> {
         names: &names,
         salt: RandomState::new().hash_one(0u64),
     };
-    if context.end.abs_diff(context.start) <= u64::from(u32::MAX)
+    if context.end.abs_diff(context.start - input::WEEK) <= u64::from(u32::MAX)
+        && context.end.abs_diff(context.start) <= u64::from(u32::MAX)
+        && dimensions.campaigns.len() <= u32::MAX as usize
         && dimensions.categories.len() <= 256
     {
         run::<u64>(
@@ -122,7 +124,7 @@ fn run<'a, P: rollup::Payload>(
                 },
                 || {
                     stage("read and validate clicks", || {
-                        context.clicks(&click_files, &aliases)
+                        context.clicks::<P::Click>(&click_files, &aliases)
                     })
                 },
             )
