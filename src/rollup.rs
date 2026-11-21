@@ -415,14 +415,12 @@ pub fn aggregate<'a>(
     mut clicks: Vec<Click<'a>>,
     dimensions: &Dimensions<'a>,
 ) -> (Vec<UserRow<'a>>, CampaignDays) {
-    events.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.time.cmp(&b.time)));
-    // Reverse click IDs within a timestamp, so the latest element wins ties.
-    clicks.sort_unstable_by(|a, b| {
-        a.person
-            .cmp(&b.person)
-            .then(a.time.cmp(&b.time))
-            .then_with(|| b.id.cmp(a.id))
-    });
+    events.sort_unstable_by_key(|event| event.person);
+    clicks.sort_unstable_by_key(|click| click.person);
+    for group in clicks.chunk_by_mut(|a, b| a.person == b.person) {
+        // Reverse IDs within a timestamp so the last click wins ties.
+        group.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| b.id.cmp(a.id)));
+    }
     let mut click_groups = clicks
         .chunk_by(|left, right| left.person == right.person)
         .peekable();
@@ -431,7 +429,8 @@ pub fn aggregate<'a>(
     let mut session_buffer = Vec::new();
     let mut category_totals = vec![0; dimensions.categories.len()];
     let mut attribution = Attribution::new(dimensions.campaigns.len());
-    for group in events.chunk_by(|left, right| left.person == right.person) {
+    for group in events.chunk_by_mut(|left, right| left.person == right.person) {
+        group.sort_unstable_by_key(|event| event.time);
         let person = group[0].person;
         let mut matching_clicks = &[][..];
         while let Some(next) = click_groups.peek() {
