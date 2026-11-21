@@ -598,6 +598,35 @@ impl Aliases {
     }
 }
 
+#[inline(always)]
+fn link_fields(line: &[u8]) -> Option<[&[u8]; 2]> {
+    #[cfg(target_arch = "x86_64")]
+    if (16..=32).contains(&line.len()) {
+        use core::arch::x86_64::*;
+        let off = line.len() - 16;
+        let (comma, quotes) = unsafe {
+            let a = _mm_loadu_si128(line.as_ptr().cast());
+            let b = _mm_loadu_si128(line.as_ptr().add(off).cast());
+            let mask = |k| {
+                let k = _mm_set1_epi8(k);
+                _mm_movemask_epi8(_mm_cmpeq_epi8(a, k)) as u32
+                    | ((_mm_movemask_epi8(_mm_cmpeq_epi8(b, k)) as u32) << off)
+            };
+            (mask(b',' as i8), mask(b'"' as i8).count_ones())
+        };
+        if !comma.is_power_of_two() {
+            return None;
+        }
+        let sep = comma.trailing_zeros() as usize;
+        let (a, b) = (&line[..sep], &line[sep + 1..]);
+        let qa = usize::from(a.len() >= 2 && a[0] == b'"' && a[a.len() - 1] == b'"');
+        let qb = usize::from(b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"');
+        return (quotes == 2 * (qa + qb) as u32)
+            .then(|| [&a[qa..a.len() - qa], &b[qb..b.len() - qb]]);
+    }
+    fields(line)
+}
+
 pub fn aliases(files: &[Mmap], names: &Names, people: &People) -> Aliases {
     fn root(parent: &mut [usize], mut i: usize) -> usize {
         while i != parent[i] {
@@ -607,29 +636,80 @@ pub fn aliases(files: &[Mmap], names: &Names, people: &People) -> Aliases {
         i
     }
     let mut parent: Vec<_> = (0..people.direct_len()).collect();
-    for [left, right] in files.iter().flat_map(|f| lines(f).filter_map(fields::<2>)) {
-        if left.is_empty() || right.is_empty() {
+    let mut pending = Vec::with_capacity(64);
+    let mut join = |pending: &mut Vec<(Key, Key, Key, Key)>| {
+        for &(a, b, _, _) in &*pending {
+            people.prefetch(a);
+            people.prefetch(b);
+        }
+        for (a, b, _, _) in &mut *pending {
+            *a = people.person(*a);
+            *b = people.person(*b);
+            if let Some(p) = parent.get(*a as usize) {
+                prefetch(p);
+            }
+            if let Some(p) = parent.get(*b as usize) {
+                prefetch(p);
+            }
+        }
+        for (a, b, left, right) in pending.drain(..) {
+            let a = a as usize;
+            let b = b as usize;
+            let need = a.max(b) + 1;
+            if need > parent.len() {
+                parent.extend(parent.len()..need);
+            }
+            let left_slot = a;
+            let right_slot = b;
+            let a = root(&mut parent, a);
+            let b = root(&mut parent, b);
+            if a != b {
+                if names
+                    .compare(
+                        if a == left_slot {
+                            left
+                        } else {
+                            people.key(a as Key)
+                        },
+                        if b == right_slot {
+                            right
+                        } else {
+                            people.key(b as Key)
+                        },
+                    )
+                    .is_lt()
+                {
+                    parent[b] = a;
+                } else {
+                    parent[a] = b;
+                }
+            }
+        }
+    };
+    for file in files {
+        let mut lines = memchr::memchr_iter(b'\n', file);
+        let Some(header) = lines.next() else {
             continue;
-        }
-        let a = people.person(names.key(left)) as usize;
-        let b = people.person(names.key(right)) as usize;
-        let need = a.max(b) + 1;
-        if need > parent.len() {
-            parent.extend(parent.len()..need);
-        }
-        let a = root(&mut parent, a);
-        let b = root(&mut parent, b);
-        if a != b {
-            if names
-                .compare(people.key(a as Key), people.key(b as Key))
-                .is_lt()
-            {
-                parent[b] = a;
-            } else {
-                parent[a] = b;
+        };
+        let mut start = header + 1;
+        for end in lines.chain(std::iter::once(file.len())) {
+            let Some(row) = file.get(start..end) else {
+                break;
+            };
+            start = end + 1;
+            if let Some([a, b]) = link_fields(row) {
+                if !a.is_empty() && !b.is_empty() {
+                    let a = names.key(a);
+                    let b = names.key(b);
+                    pending.push((a, b, a, b));
+                    if pending.len() == 64 {
+                        join(&mut pending);
+                    }
+                }
             }
         }
     }
+    join(&mut pending);
     for i in 0..parent.len() {
         parent[i] = root(&mut parent, i);
     }

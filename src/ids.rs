@@ -90,6 +90,18 @@ impl Names {
         }
         if (LONG_ASCII_MIN..INTERNED).contains(&a) && (LONG_ASCII_MIN..INTERNED).contains(&b) {
             a.cmp(&b)
+        } else if a < INTERNED && b < INTERNED {
+            // Right-pad to nine bytes to compare the common prefix. Length
+            // breaks ties when an identifier ends in zero bytes.
+            let order = |key: Key| {
+                if key >= LONG_ASCII_MIN {
+                    (key, 9)
+                } else {
+                    let len = key.ilog2() / 7;
+                    ((key ^ (1 << (7 * len))) << (7 * (9 - len)), len)
+                }
+            };
+            order(a).cmp(&order(b))
         } else {
             self.bytes(a).cmp(&self.bytes(b))
         }
