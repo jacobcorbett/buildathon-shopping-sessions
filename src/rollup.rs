@@ -5,7 +5,9 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 pub const USER_GROUPS: usize = PARTITIONS * 2;
-const ID_PARTS: usize = 256;
+// Deduplication partitions. Smaller partitions keep their filters and
+// duplicate tables cache-resident on the largest inputs.
+const ID_PARTS: usize = 1024;
 // Keep nearby handles together so reading original user IDs is cache-local.
 const PERSON_TILE: usize = 64;
 
