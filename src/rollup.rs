@@ -5,7 +5,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 pub const USER_GROUPS: usize = PARTITIONS * 2;
-const ID_PARTS: usize = 1024;
+const ID_PARTS: usize = 256;
 // Keep nearby handles together so reading original user IDs is cache-local.
 const PERSON_TILE: usize = 64;
 
