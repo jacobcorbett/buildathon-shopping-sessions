@@ -6,6 +6,21 @@ use rayon::prelude::*;
 
 pub const USER_GROUPS: usize = PARTITIONS * 2;
 const ID_PARTS: usize = 1024;
+// Keep nearby handles together so reading original user IDs is cache-local.
+const PERSON_TILE: usize = 64;
+
+#[inline]
+fn person_group(id: Key) -> usize {
+    (id as usize / PERSON_TILE) % USER_GROUPS
+}
+#[inline]
+fn person_slot(id: Key) -> usize {
+    (id as usize / (USER_GROUPS * PERSON_TILE)) * PERSON_TILE + (id as usize % PERSON_TILE)
+}
+#[inline]
+fn group_person(slot: usize, group: usize) -> Key {
+    ((slot / PERSON_TILE * USER_GROUPS + group) * PERSON_TILE + slot % PERSON_TILE) as Key
+}
 const INVALID_TIME: i64 = i64::MIN;
 const SESSION_GAP: i64 = 1_800_000;
 
@@ -353,7 +368,7 @@ impl<'a> Context<'a> {
                 let mut emit = |mut event: Event<P>| {
                     if event.person != 0 {
                         event.person = aliases.person(event.person - 1);
-                        shards[event.person as usize % USER_GROUPS].push(event, self.start);
+                        shards[person_group(event.person)].push(event, self.start);
                     }
                 };
                 for chunks in buckets {
@@ -460,7 +475,7 @@ impl<'a> Context<'a> {
                 }
                 for (part, click) in batch {
                     click.person = aliases.person(click.person);
-                    *part = click.person as usize % USER_GROUPS;
+                    *part = person_group(click.person);
                 }
             },
         )
@@ -694,13 +709,16 @@ pub fn aggregate<'a, P: Payload>(
     if count == 0 {
         return;
     }
-    // All handles in a shard share their low bits. Count directly by the
-    // remaining bits, then reuse the counts as backwards scatter cursors.
-    let residue = events.iter().find_map(EventShard::first).unwrap() as usize % USER_GROUPS;
-    let mut groups = vec![Group::default(); people.direct_len().div_ceil(USER_GROUPS)];
+    // Each shard owns a stripe of tiles. The local slot retains position
+    // within its tile. Reuse the per-slot counts as backwards scatter cursors.
+    let shard = person_group(events.iter().find_map(EventShard::first).unwrap());
+    let mut groups = vec![
+        Group::default();
+        people.direct_len().div_ceil(USER_GROUPS * PERSON_TILE) * PERSON_TILE
+    ];
     for part in &events {
         part.people(|person| {
-            let slot = person as usize / USER_GROUPS;
+            let slot = person_slot(person);
             if slot >= groups.len() {
                 groups.resize(slot + 1, Group::default());
             }
@@ -708,7 +726,7 @@ pub fn aggregate<'a, P: Payload>(
         });
     }
     for click in clicks.iter().flatten() {
-        if let Some(group) = groups.get_mut(click.person as usize / USER_GROUPS) {
+        if let Some(group) = groups.get_mut(person_slot(click.person)) {
             group.clicks += 1;
         }
     }
@@ -722,14 +740,14 @@ pub fn aggregate<'a, P: Payload>(
     let mut sorted_events = vec![P::encode(origin, 0, 0, origin); event_offset];
     for part in events {
         part.unpack(origin, |event| {
-            let group = &mut groups[event.person as usize / USER_GROUPS];
+            let group = &mut groups[person_slot(event.person)];
             group.events -= 1;
             sorted_events[group.events] = event.payload;
         });
     }
     let mut sorted_clicks = vec![P::Click::default(); click_offset];
     for click in clicks.into_iter().flatten() {
-        if let Some(group) = groups.get_mut(click.person as usize / USER_GROUPS) {
+        if let Some(group) = groups.get_mut(person_slot(click.person)) {
             group.clicks -= 1;
             sorted_clicks[group.clicks] = click.data;
         }
@@ -745,7 +763,7 @@ pub fn aggregate<'a, P: Payload>(
         if pair[0].events == pair[1].events {
             continue;
         }
-        let person = people.key((slot * USER_GROUPS + residue) as Key);
+        let person = people.key(group_person(slot, shard));
         let events = &mut sorted_events[pair[0].events..pair[1].events];
         let clicks = &mut sorted_clicks[pair[0].clicks..pair[1].clicks];
         P::sort(events);
