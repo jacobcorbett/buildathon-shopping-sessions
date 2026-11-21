@@ -37,7 +37,11 @@ pub fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes.split(|&byte| byte == b'\n').skip(1)
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "bmi2"
+))]
 #[inline(always)]
 fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
     use core::arch::x86_64::*;
@@ -65,8 +69,18 @@ fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
     if left.count_ones() + (right >> overlap).count_ones() != 6 {
         return None;
     }
-    if left.count_ones() < 3 || right.count_ones() < 3 {
+    // A leading and trailing quote must belong to the same field. Extract
+    // quote flags next to the first three and last three commas in field order.
+    if (left & (u64::MAX >> 1)).count_ones() < 3 || (right >> 1).count_ones() < 3 {
         return fields(line);
+    }
+    let skip = right.count_ones() - 3;
+    let compressed =
+        |lo, hi| unsafe { (_pext_u64(lo, left) & 7) | ((_pext_u64(hi, right) >> skip) << 3) };
+    let opens = u64::from(ql & 1 != 0) | (compressed(ql >> 1, qr >> 1) << 1);
+    let closes = compressed(ql << 1, qr << 1) | ((qr >> 63) << 6);
+    if opens != closes || 2 * opens.count_ones() != ql.count_ones() + (qr >> overlap).count_ones() {
+        return None;
     }
     let mut right = right.reverse_bits();
     let mut ends = [0; 7];
@@ -79,24 +93,28 @@ fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
     }
     let mut row = [&[][..]; 7];
     let mut start = 0usize;
-    let mut stripped = 0;
-    for (field, end) in row.iter_mut().zip(ends) {
-        let open = line[start.min(len - 1)] == b'"';
-        let close = line[end.saturating_sub(1)] == b'"';
-        let trim = usize::from((end - start >= 2) & open & close);
-        *field = &line[start + trim..end - trim];
+    for (i, (field, end)) in row.iter_mut().zip(ends).enumerate() {
+        let trim = ((opens >> i) & 1) as usize;
+        *field = line.get(start + trim..end.checked_sub(trim)?)?;
         start = end + 1;
-        stripped += 2 * trim as u32;
     }
-    (stripped == ql.count_ones() + (qr >> overlap).count_ones()).then_some(row)
+    Some(row)
 }
 #[inline(always)]
 pub fn event_row(line: &[u8]) -> Option<[&[u8]; 7]> {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "bmi2"
+    ))]
     {
         event_fields(line)
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "bmi2"
+    )))]
     {
         fields(line)
     }
