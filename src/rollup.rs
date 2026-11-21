@@ -5,7 +5,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 pub const USER_GROUPS: usize = PARTITIONS * 2;
-const ID_PARTS: usize = 256;
+const ID_PARTS: usize = 1024;
 const INVALID_TIME: i64 = i64::MIN;
 const SESSION_GAP: i64 = 1_800_000;
 
@@ -284,26 +284,9 @@ impl<'a> Context<'a> {
     ) -> Vec<Shards<Event<P>>> {
         let by_person = by_id
             .into_par_iter()
-            .map(|chunks| {
-                let capacity: usize = chunks.iter().map(Vec::len).sum();
-                let words = (capacity * 8 + 1).next_power_of_two().div_ceil(64);
-                let mut seen = vec![0u64; words];
-                let mut repeated = vec![0u64; words];
-                let position = |key: Key| {
-                    let word = (key as usize / ID_PARTS) & (words - 1);
-                    let mask = (1u64 << ((key >> 35) & 63))
-                        | (1u64 << ((key >> 48) & 63))
-                        | (1u64 << ((key >> 57) & 63));
-                    (word, mask)
-                };
-                for item in chunks.iter().flatten() {
-                    let (i, mask) = position(item.id);
-                    let prior = seen[i];
-                    if prior & mask == mask {
-                        repeated[i] |= mask;
-                    }
-                    seen[i] = prior | mask;
-                }
+            .chunks(ID_PARTS / PARTITIONS)
+            .map(|buckets| {
+                let capacity: usize = buckets.iter().flatten().map(Vec::len).sum();
                 let mut shards: Shards<Event<P>> = (0..USER_GROUPS)
                     .map(|_| Vec::with_capacity(capacity / USER_GROUPS))
                     .collect();
@@ -313,34 +296,56 @@ impl<'a> Context<'a> {
                         shards[event.person as usize % USER_GROUPS].push(event);
                     }
                 };
-                let mut winners = AHashMap::with_capacity(capacity / 8);
-                for chunk in &chunks {
-                    for batch in chunk.chunks(32) {
-                        for item in batch {
-                            aliases.prefetch(item.event.person.wrapping_sub(1));
+                for chunks in buckets {
+                    let capacity: usize = chunks.iter().map(Vec::len).sum();
+
+                    let words = (capacity * 8 + 1).next_power_of_two().div_ceil(64);
+                    let mut seen = vec![0u64; words];
+                    let mut repeated = vec![0u64; words];
+                    let position = |key: Key| {
+                        let word = (key as usize / ID_PARTS) & (words - 1);
+                        let mask = (1u64 << ((key >> 35) & 63))
+                            | (1u64 << ((key >> 48) & 63))
+                            | (1u64 << ((key >> 57) & 63));
+                        (word, mask)
+                    };
+                    for item in chunks.iter().flatten() {
+                        let (i, mask) = position(item.id);
+                        let prior = seen[i];
+                        if prior & mask == mask {
+                            repeated[i] |= mask;
                         }
-                        for item in batch {
-                            let (i, mask) = position(item.id);
-                            if repeated[i] & mask != mask {
-                                emit(item.event);
-                            } else {
-                                use std::collections::hash_map::Entry;
-                                match winners.entry(item.id) {
-                                    Entry::Vacant(e) => {
-                                        e.insert(item);
-                                    }
-                                    Entry::Occupied(mut e) => {
-                                        if item.ingest < e.get().ingest {
+                        seen[i] = prior | mask;
+                    }
+                    let mut winners = AHashMap::with_capacity(capacity / 8);
+                    for chunk in &chunks {
+                        for batch in chunk.chunks(32) {
+                            for item in batch {
+                                aliases.prefetch(item.event.person.wrapping_sub(1));
+                            }
+                            for item in batch {
+                                let (i, mask) = position(item.id);
+                                if repeated[i] & mask != mask {
+                                    emit(item.event);
+                                } else {
+                                    use std::collections::hash_map::Entry;
+                                    match winners.entry(item.id) {
+                                        Entry::Vacant(e) => {
                                             e.insert(item);
+                                        }
+                                        Entry::Occupied(mut e) => {
+                                            if item.ingest < e.get().ingest {
+                                                e.insert(item);
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                for winner in winners.into_values() {
-                    emit(winner.event);
+                    for winner in winners.into_values() {
+                        emit(winner.event);
+                    }
                 }
                 shards
             })
