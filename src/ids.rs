@@ -80,6 +80,25 @@ impl<'a> Names<'a> {
         key
     }
 
+    pub fn less(&self, a: Key, b: Key) -> bool {
+        if a < INTERNED && b < INTERNED {
+            if a >= LONG_ASCII_MIN && b >= LONG_ASCII_MIN {
+                return a < b;
+            }
+            let align = |key: Key| {
+                if key >= LONG_ASCII_MIN {
+                    (key, 9)
+                } else {
+                    let length = key.ilog2() / 7;
+                    let payload = key ^ (1 << (length * 7));
+                    (payload << ((9 - length) * 7), length)
+                }
+            };
+            return align(a) < align(b);
+        }
+        self.bytes(a) < self.bytes(b)
+    }
+
     pub fn bytes(&self, key: Key) -> Vec<u8> {
         if key & INTERNED != 0 {
             return self.interned.lock().unwrap().values[(key & !INTERNED) as usize].to_vec();

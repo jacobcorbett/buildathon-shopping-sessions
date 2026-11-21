@@ -144,7 +144,7 @@ impl<'a> Context<'a> {
     pub fn deduplicate_events(
         &self,
         by_id: Vec<Shards<PendingEvent>>,
-        aliases: &AHashMap<Key, Key>,
+        aliases: &input::Aliases,
     ) -> Vec<Shards<Event>> {
         let by_person = by_id
             .into_par_iter()
@@ -172,7 +172,7 @@ impl<'a> Context<'a> {
                 for item in chunks.into_iter().flatten() {
                     let mut event = item.event;
                     if event.time != INVALID_TIME {
-                        event.person = aliases.get(&event.person).copied().unwrap_or(event.person);
+                        event.person = aliases.resolve(event.person);
                         shards[self.partition(event.person)].push(event);
                     }
                 }
@@ -182,11 +182,7 @@ impl<'a> Context<'a> {
         input::transpose(by_person)
     }
 
-    pub fn clicks(
-        &self,
-        files: &'a [Mmap],
-        aliases: &AHashMap<Key, Key>,
-    ) -> Vec<Shards<Click<'a>>> {
+    pub fn clicks(&self, files: &'a [Mmap], aliases: &input::Aliases) -> Vec<Shards<Click<'a>>> {
         input::route(files, self.workers, |line| {
             let [id, user, campaign, ts] = input::fields(line)?;
             if id.is_empty() || user.is_empty() {
@@ -198,7 +194,7 @@ impl<'a> Context<'a> {
                 return None;
             }
             let user = self.names.key(user);
-            let person = aliases.get(&user).copied().unwrap_or(user);
+            let person = aliases.resolve(user);
             // Repeated click IDs have identical values. Keeping copies cannot
             // change the winning click or whether a campaign is active.
             Some((

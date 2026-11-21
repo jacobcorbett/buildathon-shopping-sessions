@@ -1,5 +1,5 @@
 use crate::ids::{Key, Names};
-use ahash::AHashMap;
+use ahash::RandomState;
 use memchr::memchr;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
@@ -212,6 +212,10 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
 }
 
 pub fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
+    sized_chunks(files, CHUNK_BYTES)
+}
+
+fn sized_chunks(files: &[Mmap], bytes: usize) -> Vec<&[u8]> {
     let mut chunks = Vec::new();
     for file in files {
         let mut remainder = match memchr(b'\n', file) {
@@ -219,9 +223,8 @@ pub fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
             None => continue,
         };
         while !remainder.is_empty() {
-            let limit = if remainder.len() > CHUNK_BYTES {
-                memchr(b'\n', &remainder[CHUNK_BYTES..])
-                    .map_or(remainder.len(), |end| CHUNK_BYTES + end + 1)
+            let limit = if remainder.len() > bytes {
+                memchr(b'\n', &remainder[bytes..]).map_or(remainder.len(), |end| bytes + end + 1)
             } else {
                 remainder.len()
             };
@@ -289,52 +292,130 @@ pub fn merge<T>(mut parts: Shards<T>) -> Vec<T> {
     result
 }
 
-pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>) -> AHashMap<Key, Key> {
-    fn root(parent: &mut [usize], mut node: usize) -> usize {
-        while parent[node] != node {
-            parent[node] = parent[parent[node]];
-            node = parent[node];
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering::{AcqRel, Acquire, Relaxed},
+};
+
+struct Vertex {
+    key: AtomicU64,
+    parent: AtomicU64,
+}
+
+pub struct Aliases {
+    hash: RandomState,
+    vertices: Vec<Vertex>,
+}
+
+impl Aliases {
+    fn slot(&self, key: Key, insert: bool) -> Option<usize> {
+        let mask = self.vertices.len() - 1;
+        let mut i = self.hash.hash_one(key) as usize & mask;
+        loop {
+            let cell = &self.vertices[i].key;
+            let mut found = cell.load(Relaxed);
+            if found == 0 {
+                if !insert {
+                    return None;
+                }
+                found = match cell.compare_exchange(0, key, Relaxed, Relaxed) {
+                    Ok(_) => key,
+                    Err(current) => current,
+                };
+            }
+            if found == key {
+                return Some(i);
+            }
+            i = (i + 1) & mask;
         }
-        node
     }
 
-    let mut ids = AHashMap::new();
-    let mut parent = Vec::new();
-    let mut sizes = Vec::new();
-    let mut minimum = Vec::new();
-    for [left, right] in files
-        .iter()
-        .flat_map(|file| lines(file).filter_map(fields::<2>))
-    {
-        if left.is_empty() || right.is_empty() {
-            continue;
+    fn root(&self, mut i: usize) -> usize {
+        loop {
+            let parent = self.vertices[i].parent.load(Acquire) as usize;
+            if parent == i {
+                return i;
+            }
+            let grandparent = self.vertices[parent].parent.load(Acquire);
+            let _ = self.vertices[i].parent.compare_exchange(
+                parent as u64,
+                grandparent,
+                AcqRel,
+                Acquire,
+            );
+            i = grandparent as usize;
         }
-        let mut index = |id| {
-            let key = names.key(id);
-            *ids.entry(key).or_insert_with(|| {
-                let n = parent.len();
-                parent.push(n);
-                sizes.push(1);
-                minimum.push((id, key));
-                n
-            })
-        };
-        let (left, right) = (index(left), index(right));
-        let (mut a, mut b) = (root(&mut parent, left), root(&mut parent, right));
-        if a == b {
-            continue;
-        }
-        if sizes[a] < sizes[b] {
-            std::mem::swap(&mut a, &mut b);
-        }
-        parent[b] = a;
-        sizes[a] += sizes[b];
-        minimum[a] = minimum[a].min(minimum[b]);
     }
-    ids.into_iter()
-        .filter_map(|(key, node)| {
-            let person = minimum[root(&mut parent, node)].1;
-            (key != person).then_some((key, person))
-        })
-        .collect()
+
+    fn join(&self, mut a: usize, mut b: usize, names: &Names<'_>) {
+        loop {
+            a = self.root(a);
+            b = self.root(b);
+            if a == b {
+                return;
+            }
+            // Every successful link points toward a strictly smaller name.
+            // A competing link retries at the new root, so cycles cannot form.
+            if names.less(
+                self.vertices[a].key.load(Relaxed),
+                self.vertices[b].key.load(Relaxed),
+            ) {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if self.vertices[a]
+                .parent
+                .compare_exchange(a as u64, b as u64, AcqRel, Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    pub fn resolve(&self, key: Key) -> Key {
+        self.slot(key, false)
+            .map_or(key, |i| self.vertices[i].parent.load(Relaxed))
+    }
+}
+
+pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>) -> Aliases {
+    let chunks = sized_chunks(files, 128 * 1024);
+    // Each row introduces at most two names. Include unterminated last
+    // lines and retain at least one empty slot for unsuccessful lookups.
+    let lines: usize = chunks
+        .par_iter()
+        .map(|c| memchr::memchr_iter(b'\n', c).count() + 1)
+        .sum();
+    let capacity = (2 * lines + 1).next_power_of_two();
+    let graph = Aliases {
+        hash: RandomState::new(),
+        vertices: (0..capacity)
+            .into_par_iter()
+            .map(|i| Vertex {
+                key: AtomicU64::new(0),
+                parent: AtomicU64::new(i as u64),
+            })
+            .collect(),
+    };
+    chunks.par_iter().for_each(|chunk| {
+        for [a, b] in chunk.split(|&byte| byte == b'\n').filter_map(fields::<2>) {
+            if !a.is_empty() && !b.is_empty() {
+                let a = graph.slot(names.key(a), true).unwrap();
+                let b = graph.slot(names.key(b), true).unwrap();
+                graph.join(a, b, names);
+            }
+        }
+    });
+    graph.vertices.par_iter().enumerate().for_each(|(i, v)| {
+        v.parent.store(graph.root(i) as u64, Relaxed);
+    });
+    // The first pass finishes every path before this pass replaces root
+    // indices with keys. Lookups then need just one probe sequence.
+    graph.vertices.par_iter().for_each(|v| {
+        let person = graph.vertices[v.parent.load(Relaxed) as usize]
+            .key
+            .load(Relaxed);
+        v.parent.store(person, Relaxed);
+    });
+    graph
 }
