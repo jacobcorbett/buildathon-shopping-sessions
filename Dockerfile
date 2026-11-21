@@ -6,7 +6,8 @@ COPY src/ src/
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --locked --jobs 4 \
+    cargo clean --release -p shopping-sessions \
+    && cargo build --release --locked --jobs 4 \
     && cp target/release/shopping-sessions /shopping-sessions
 
 FROM debian:trixie-slim
