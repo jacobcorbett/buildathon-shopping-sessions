@@ -1,8 +1,12 @@
 use crate::ids::{Key, Names};
-use ahash::RandomState;
+use ahash::{AHashMap, RandomState};
 use memchr::memchr;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering::Relaxed},
+};
 use std::{fs, io, path::Path};
 
 pub type Id<'a> = &'a [u8];
@@ -285,6 +289,7 @@ pub fn route<'a, T: Send>(
     bytes_per_row: usize,
     partitions: usize,
     parse: impl Fn(&'a [u8]) -> Option<(usize, T)> + Sync,
+    prepare: impl Fn(&mut [(usize, T)]) + Sync,
 ) -> Vec<Shards<T>> {
     let chunks = chunks(files);
     let groups = (workers * 4).min(chunks.len()).max(1);
@@ -297,6 +302,13 @@ pub fn route<'a, T: Send>(
             let mut shards: Shards<T> = (0..partitions)
                 .map(|_| Vec::with_capacity(bytes / bytes_per_row / partitions))
                 .collect();
+            let mut batch = Vec::with_capacity(64);
+            let mut flush = |batch: &mut Vec<(usize, T)>| {
+                prepare(batch);
+                for (partition, item) in batch.drain(..) {
+                    shards[partition].push(item);
+                }
+            };
             for chunk in assigned {
                 for line in memchr::memchr_iter(b'\n', chunk)
                     .chain(std::iter::once(chunk.len()))
@@ -307,10 +319,14 @@ pub fn route<'a, T: Send>(
                     })
                 {
                     if let Some((partition, item)) = parse(line) {
-                        shards[partition].push(item);
+                        batch.push((partition, item));
+                        if batch.len() == 64 {
+                            flush(&mut batch);
+                        }
                     }
                 }
             }
+            flush(&mut batch);
             shards
         })
         .collect();
@@ -328,111 +344,123 @@ pub fn prefetch<T>(item: &T) {
     }
 }
 
-pub fn merge<T>(mut parts: Shards<T>) -> Vec<T> {
-    let capacity = parts.iter().map(Vec::len).sum::<usize>();
-    let mut result = parts.pop().unwrap_or_default();
-    result.reserve_exact(capacity - result.len());
-    for mut part in parts {
-        result.append(&mut part);
-    }
-    result
+#[derive(Default)]
+struct Extra {
+    ids: AHashMap<Key, usize>,
+    keys: Vec<Key>,
 }
 
-// During union, values are parent slots. The last pass replaces each slot
-// with its canonical key for a single lookup per event or click.
-#[derive(Clone, Copy, Default)]
-struct AliasSlot {
-    key: Key,
-    value: Key,
+// Each occupied slot is a stable person number. Probe chains are bounded;
+// exact overflow dictionaries also handle inputs with many distinct users.
+pub struct People {
+    slots: Vec<AtomicU64>,
+    hash: RandomState,
+    overflow: [Mutex<Extra>; 64],
+}
+
+impl People {
+    pub fn new(bytes: usize) -> Self {
+        let size = (bytes / 920 + 1).next_power_of_two();
+        Self {
+            slots: (0..size).map(|_| AtomicU64::new(0)).collect(),
+            hash: RandomState::new(),
+            overflow: std::array::from_fn(|_| Mutex::default()),
+        }
+    }
+    #[inline]
+    pub fn person(&self, key: Key) -> Key {
+        let hash = self.hash.hash_one(key) as usize;
+        let mask = self.slots.len() - 1;
+        for offset in 0..self.slots.len().min(16) {
+            let i = hash.wrapping_add(offset) & mask;
+            let mut stored = self.slots[i].load(Relaxed);
+            if stored == 0 {
+                stored = self.slots[i]
+                    .compare_exchange(0, key, Relaxed, Relaxed)
+                    .unwrap_or_else(|v| v);
+                if stored == 0 {
+                    return i as Key;
+                }
+            }
+            if stored == key {
+                return i as Key;
+            }
+        }
+        let bucket = hash % 64;
+        let mut extra = self.overflow[bucket].lock().unwrap();
+        let extra = &mut *extra;
+        let index = *extra.ids.entry(key).or_insert_with(|| {
+            let index = extra.keys.len();
+            extra.keys.push(key);
+            index
+        });
+        (self.slots.len() + index * 64 + bucket) as Key
+    }
+    #[inline]
+    pub fn prefetch(&self, key: Key) {
+        let i = self.hash.hash_one(key) as usize & (self.slots.len() - 1);
+        prefetch(&self.slots[i]);
+    }
+    pub fn key(&self, person: Key) -> Key {
+        let id = person as usize;
+        if id < self.slots.len() {
+            self.slots[id].load(Relaxed)
+        } else {
+            let i = id - self.slots.len();
+            self.overflow[i % 64].lock().unwrap().keys[i / 64]
+        }
+    }
+    pub fn direct_len(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 pub struct Aliases {
-    slots: Vec<AliasSlot>,
-    hash: RandomState,
+    parent: Vec<usize>,
 }
-
 impl Aliases {
     #[inline]
-    fn slot(&self, key: Key) -> usize {
-        let mask = self.slots.len() - 1;
-        let mut i = self.hash.hash_one(key) as usize & mask;
-        while self.slots[i].key != 0 && self.slots[i].key != key {
-            i = (i + 1) & mask;
-        }
-        i
+    pub fn person(&self, id: Key) -> Key {
+        self.parent.get(id as usize).copied().unwrap_or(id as usize) as Key
     }
-
-    #[inline]
-    pub fn prefetch(&self, key: Key) {
-        let slot = self.hash.hash_one(key) as usize & (self.slots.len() - 1);
-        prefetch(&self.slots[slot]);
-    }
-
-    #[inline]
-    pub fn person(&self, key: Key) -> Key {
-        let slot = self.slot(key);
-        if self.slots[slot].key == 0 {
-            key
-        } else {
-            self.slots[slot].value
+    pub fn prefetch(&self, id: Key) {
+        if let Some(slot) = self.parent.get(id as usize) {
+            prefetch(slot);
         }
-    }
-
-    fn root(&mut self, key: Key) -> usize {
-        let mut i = self.slot(key);
-        if self.slots[i].key == 0 {
-            self.slots[i].key = key;
-            self.slots[i].value = i as Key;
-        }
-        while self.slots[i].value != i as Key {
-            self.slots[i].value = self.slots[self.slots[i].value as usize].value;
-            i = self.slots[i].value as usize;
-        }
-        i
     }
 }
 
-pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>) -> Aliases {
-    let rows: usize = files
-        .iter()
-        .map(|file| memchr::memchr_iter(b'\n', file).count())
-        .sum();
-    // Including headers covers a final row without LF. At most two new keys
-    // can occur per row, leaving an empty slot even for disjoint links.
-    let capacity = (rows * 2 + 1).next_power_of_two();
-    let mut map = Aliases {
-        slots: vec![AliasSlot::default(); capacity],
-        hash: RandomState::new(),
-    };
-    for [left, right] in files
-        .iter()
-        .flat_map(|file| lines(file).filter_map(fields::<2>))
-    {
+pub fn aliases<'a>(files: &'a [Mmap], names: &Names<'a>, people: &People) -> Aliases {
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while i != parent[i] {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut parent: Vec<_> = (0..people.direct_len()).collect();
+    for [left, right] in files.iter().flat_map(|f| lines(f).filter_map(fields::<2>)) {
         if left.is_empty() || right.is_empty() {
             continue;
         }
-        let a = map.root(names.key(left));
-        let b = map.root(names.key(right));
+        let a = people.person(names.key(left)) as usize;
+        let b = people.person(names.key(right)) as usize;
+        let need = a.max(b) + 1;
+        if need > parent.len() {
+            parent.extend(parent.len()..need);
+        }
+        let a = root(&mut parent, a);
+        let b = root(&mut parent, b);
         if a != b {
-            if names.less(map.slots[a].key, map.slots[b].key) {
-                map.slots[b].value = a as Key;
+            if names.less(people.key(a as Key), people.key(b as Key)) {
+                parent[b] = a;
             } else {
-                map.slots[a].value = b as Key;
+                parent[a] = b;
             }
         }
     }
-    for slot in 0..capacity {
-        if map.slots[slot].key != 0 {
-            let mut root = map.slots[slot].value as usize;
-            while map.slots[root].value != root as Key {
-                root = map.slots[root].value as usize;
-            }
-            map.slots[slot].value = root as Key;
-        }
+    for i in 0..parent.len() {
+        parent[i] = root(&mut parent, i);
     }
-    for i in 0..capacity {
-        let root = map.slots[i].value as usize;
-        map.slots[i].value = map.slots[root].key;
-    }
-    map
+    Aliases { parent }
 }

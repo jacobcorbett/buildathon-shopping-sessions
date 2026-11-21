@@ -50,7 +50,16 @@ fn main() -> Result<()> {
     let campaign_file = input::map(&data.join("campaigns.csv"))?;
     let dimensions = rollup::Dimensions::new(&products, &campaign_file);
     let names = ids::Names::default();
+    let people = input::People::new(
+        event_files
+            .iter()
+            .chain(&click_files)
+            .chain(&links)
+            .map(|f| f.len())
+            .sum(),
+    );
     let context = rollup::Context {
+        people: &people,
         start: bound("window_start")?,
         end: bound("window_end")?,
         workers,
@@ -92,7 +101,11 @@ fn run<'a, P: rollup::Payload>(
     let dimensions = context.dimensions;
     let names = context.names;
     let (aliases, pending) = rayon::join(
-        || stage("resolve linked IDs", || input::aliases(links, names)),
+        || {
+            stage("resolve linked IDs", || {
+                input::aliases(links, names, context.people)
+            })
+        },
         || stage("parse events", || context.read_events::<P>(event_files)),
     );
     let (events, clicks) = rayon::join(
@@ -119,10 +132,11 @@ fn run<'a, P: rollup::Payload>(
                 let mut days = rollup::CampaignDays::new();
                 for (events, clicks) in groups {
                     rollup::aggregate(
-                        input::merge(events),
+                        events,
                         context.start,
-                        input::merge(clicks),
+                        clicks,
                         dimensions,
+                        context.people,
                         &mut rows,
                         &mut days,
                     );

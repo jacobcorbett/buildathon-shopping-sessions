@@ -3,7 +3,6 @@ use crate::input::{self, DAY, Id, PARTITIONS, Shards, WEEK};
 use ahash::{AHashMap, RandomState};
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::cmp::Ordering;
 
 pub const USER_GROUPS: usize = PARTITIONS * 8;
 const INVALID_TIME: i64 = i64::MIN;
@@ -56,6 +55,7 @@ impl<'a> Dimensions<'a> {
 
 pub trait Payload: Copy + Send + Sync {
     fn encode(time: i64, price: u32, category: u32, origin: i64) -> Self;
+    fn sort(items: &mut [Self]);
     fn time(self, origin: i64) -> i64;
     fn price(self) -> u32;
     fn category(self) -> u32;
@@ -69,6 +69,9 @@ pub struct Wide {
 }
 
 impl Payload for Wide {
+    fn sort(items: &mut [Self]) {
+        items.sort_unstable_by_key(|item| item.time);
+    }
     fn encode(time: i64, price: u32, category: u32, _: i64) -> Self {
         Self {
             time,
@@ -90,6 +93,9 @@ impl Payload for Wide {
 // The caller checks the window and category count. Valid prices fit in
 // 24 bits by the track rules. Invalid records have a zero person key.
 impl Payload for u64 {
+    fn sort(items: &mut [Self]) {
+        items.sort_unstable();
+    }
     fn encode(time: i64, price: u32, category: u32, origin: i64) -> Self {
         ((time.wrapping_sub(origin) as u64) << 32) | (u64::from(category) << 24) | u64::from(price)
     }
@@ -117,6 +123,7 @@ pub struct PendingEvent<P> {
     event: Event<P>,
 }
 
+#[derive(Clone, Copy)]
 pub struct Click<'a> {
     person: Key,
     time: i64,
@@ -125,6 +132,7 @@ pub struct Click<'a> {
 }
 
 pub struct Context<'a> {
+    pub people: &'a input::People,
     pub start: i64,
     pub end: i64,
     pub workers: usize,
@@ -191,9 +199,23 @@ impl<'a> Context<'a> {
     }
 
     pub fn read_events<P: Payload>(&self, files: &'a [Mmap]) -> Vec<Shards<PendingEvent<P>>> {
-        input::route(files, self.workers, 72, PARTITIONS, |line| {
-            self.parse_event(line)
-        })
+        input::route(
+            files,
+            self.workers,
+            72,
+            PARTITIONS,
+            |line| self.parse_event(line),
+            |batch| {
+                for (_, item) in &*batch {
+                    self.people.prefetch(item.event.person);
+                }
+                for (_, item) in batch {
+                    if item.event.person != 0 {
+                        item.event.person = self.people.person(item.event.person) + 1;
+                    }
+                }
+            },
+        )
     }
 
     pub fn deduplicate_events<P: Payload>(
@@ -223,15 +245,15 @@ impl<'a> Context<'a> {
                     .collect();
                 let mut emit = |mut event: Event<P>| {
                     if event.person != 0 {
-                        event.person = aliases.person(event.person);
-                        shards[self.hash.hash_one(event.person) as usize % USER_GROUPS].push(event);
+                        event.person = aliases.person(event.person - 1);
+                        shards[event.person as usize % USER_GROUPS].push(event);
                     }
                 };
                 let mut winners = AHashMap::with_capacity(capacity / 8);
                 for chunk in &chunks {
                     for batch in chunk.chunks(32) {
                         for item in batch {
-                            aliases.prefetch(item.event.person);
+                            aliases.prefetch(item.event.person.wrapping_sub(1));
                         }
                         for item in batch {
                             let pos = slot(item.id);
@@ -256,30 +278,45 @@ impl<'a> Context<'a> {
     }
 
     pub fn clicks(&self, files: &'a [Mmap], aliases: &input::Aliases) -> Vec<Shards<Click<'a>>> {
-        input::route(files, self.workers, 48, USER_GROUPS, |line| {
-            let [id, user, campaign, ts] = input::fields(line)?;
-            if id.is_empty() || user.is_empty() {
-                return None;
-            }
-            let &campaign = self.dimensions.campaign_index.get(campaign)?;
-            let time = input::timestamp(ts)?;
-            if time < self.start - WEEK || time >= self.end {
-                return None;
-            }
-            let user = self.names.key(user);
-            let person = aliases.person(user);
-            // Repeated click IDs have identical values. Keeping copies cannot
-            // change the winning click or whether a campaign is active.
-            Some((
-                self.hash.hash_one(person) as usize % USER_GROUPS,
-                Click {
-                    person,
-                    time,
-                    id,
-                    campaign,
-                },
-            ))
-        })
+        input::route(
+            files,
+            self.workers,
+            48,
+            USER_GROUPS,
+            |line| {
+                let [id, user, campaign, ts] = input::fields(line)?;
+                if id.is_empty() || user.is_empty() {
+                    return None;
+                }
+                let &campaign = self.dimensions.campaign_index.get(campaign)?;
+                let time = input::timestamp(ts)?;
+                if time < self.start - WEEK || time >= self.end {
+                    return None;
+                }
+                let user = self.names.key(user);
+                let person = user;
+                // Repeated click IDs have identical values. Keeping copies cannot
+                // change the winning click or whether a campaign is active.
+                Some((
+                    person as usize % USER_GROUPS,
+                    Click {
+                        person,
+                        time,
+                        id,
+                        campaign,
+                    },
+                ))
+            },
+            |batch| {
+                for (_, click) in &*batch {
+                    self.people.prefetch(click.person);
+                }
+                for (part, click) in batch {
+                    click.person = aliases.person(self.people.person(click.person));
+                    *part = click.person as usize % USER_GROUPS;
+                }
+            },
+        )
     }
 }
 
@@ -425,16 +462,16 @@ fn top_category<'a>(totals: &[i64], names: &[Id<'a>]) -> Option<Id<'a>> {
 }
 
 fn sessionise<'a, P: Payload>(
-    events: &[Event<P>],
+    person: Key,
+    events: &[P],
     origin: i64,
     categories: &[Id<'a>],
     category_totals: &mut [i64],
     sessions: &mut Vec<Session>,
     user_rows: &mut Vec<UserRow<'a>>,
 ) {
-    let person = events[0].person;
     let mut session = Session {
-        start: events[0].payload.time(origin),
+        start: events[0].time(origin),
         revenue: 0,
     };
     let mut day_row = UserRow {
@@ -447,10 +484,10 @@ fn sessionise<'a, P: Payload>(
     };
     let mut previous = session.start;
     for event in events {
-        if event.payload.time(origin) - previous > SESSION_GAP {
+        if event.time(origin) - previous > SESSION_GAP {
             sessions.push(session);
             session = Session {
-                start: event.payload.time(origin),
+                start: event.time(origin),
                 revenue: 0,
             };
             let start_day = day(session.start);
@@ -469,13 +506,13 @@ fn sessionise<'a, P: Payload>(
             }
             day_row.sessions += 1;
         }
-        previous = event.payload.time(origin);
+        previous = event.time(origin);
         day_row.events += 1;
-        if event.payload.price() != 0 {
-            let price = i64::from(event.payload.price());
+        if event.price() != 0 {
+            let price = i64::from(event.price());
             session.revenue += price;
             day_row.revenue += price;
-            category_totals[event.payload.category() as usize] += price;
+            category_totals[event.category() as usize] += price;
         }
     }
     sessions.push(session);
@@ -484,57 +521,110 @@ fn sessionise<'a, P: Payload>(
     category_totals.fill(0);
 }
 
+#[derive(Default)]
+struct Group {
+    person: Key,
+    n_events: usize,
+    n_clicks: usize,
+    event_end: usize,
+    click_end: usize,
+}
+
 pub fn aggregate<'a, P: Payload>(
-    mut events: Vec<Event<P>>,
+    events: Shards<Event<P>>,
     origin: i64,
-    mut clicks: Vec<Click<'a>>,
+    clicks: Shards<Click<'a>>,
     dimensions: &Dimensions<'a>,
-    user_rows: &mut Vec<UserRow<'a>>,
+    people: &input::People,
+    rows: &mut Vec<UserRow<'a>>,
     days: &mut CampaignDays,
 ) {
-    events.sort_unstable_by(|a, b| {
-        a.person
-            .cmp(&b.person)
-            .then(a.payload.time(origin).cmp(&b.payload.time(origin)))
-    });
-    // Reverse click IDs within a timestamp, so the latest element wins ties.
-    clicks.sort_unstable_by(|a, b| {
-        a.person
-            .cmp(&b.person)
-            .then(a.time.cmp(&b.time))
-            .then_with(|| b.id.cmp(a.id))
-    });
-    let mut click_groups = clicks
-        .chunk_by(|left, right| left.person == right.person)
-        .peekable();
-
-    let mut session_buffer = Vec::new();
-    let mut category_totals = vec![0; dimensions.categories.len()];
-    let mut attribution = Attribution::new(dimensions.campaigns.len());
-    for group in events.chunk_by(|left, right| left.person == right.person) {
-        let person = group[0].person;
-        let mut matching_clicks = &[][..];
-        while let Some(next) = click_groups.peek() {
-            match next[0].person.cmp(&person) {
-                Ordering::Less => {
-                    click_groups.next();
-                }
-                Ordering::Equal => {
-                    matching_clicks = click_groups.next().unwrap();
-                    break;
-                }
-                Ordering::Greater => break,
-            }
+    let count: usize = events.iter().map(Vec::len).sum();
+    if count == 0 {
+        return;
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    // All handles in a shard share their low bits. The quotient directly
+    // indexes each person without a second hash or a comparison sort.
+    let mut lookup = vec![usize::MAX; people.direct_len().div_ceil(USER_GROUPS)];
+    let mut event_groups = Vec::with_capacity(count);
+    for event in events.iter().flatten() {
+        let slot = event.person as usize / USER_GROUPS;
+        if slot >= lookup.len() {
+            lookup.resize(slot + 1, usize::MAX);
         }
+        let id = if lookup[slot] != usize::MAX {
+            lookup[slot]
+        } else {
+            let id = groups.len();
+            groups.push(Group {
+                person: people.key(event.person),
+                ..Group::default()
+            });
+            lookup[slot] = id;
+            id
+        };
+        groups[id].n_events += 1;
+        event_groups.push(id);
+    }
+    let mut click_groups = Vec::new();
+    for click in clicks.iter().flatten() {
+        let id = lookup
+            .get(click.person as usize / USER_GROUPS)
+            .copied()
+            .filter(|&id| id != usize::MAX);
+        if let Some(i) = id {
+            groups[i].n_clicks += 1;
+        }
+        click_groups.push(id.unwrap_or(usize::MAX));
+    }
+    let (mut event_offset, mut click_offset) = (0, 0);
+    for group in &mut groups {
+        group.event_end = event_offset;
+        event_offset += group.n_events;
+        group.click_end = click_offset;
+        click_offset += group.n_clicks;
+    }
+    let mut sorted_events = vec![P::encode(origin, 0, 0, origin); event_offset];
+    for (event, id) in events.into_iter().flatten().zip(event_groups) {
+        let end = &mut groups[id].event_end;
+        sorted_events[*end] = event.payload;
+        *end += 1;
+    }
+    let mut sorted_clicks = vec![
+        Click {
+            person: 0,
+            time: 0,
+            id: &[],
+            campaign: 0
+        };
+        click_offset
+    ];
+    for (click, id) in clicks.into_iter().flatten().zip(click_groups) {
+        if id != usize::MAX {
+            let end = &mut groups[id].click_end;
+            sorted_clicks[*end] = click;
+            *end += 1;
+        }
+    }
+    let mut sessions = Vec::new();
+    let mut totals = vec![0; dimensions.categories.len()];
+    let mut attribution = Attribution::new(dimensions.campaigns.len());
+    for group in groups {
+        let events = &mut sorted_events[group.event_end - group.n_events..group.event_end];
+        let clicks = &mut sorted_clicks[group.click_end - group.n_clicks..group.click_end];
+        P::sort(events);
+        clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| b.id.cmp(a.id)));
         sessionise(
-            group,
+            group.person,
+            events,
             origin,
             &dimensions.categories,
-            &mut category_totals,
-            &mut session_buffer,
-            user_rows,
+            &mut totals,
+            &mut sessions,
+            rows,
         );
-        attribution.attribute(&session_buffer, matching_clicks, days);
-        session_buffer.clear();
+        attribution.attribute(&sessions, clicks, days);
+        sessions.clear();
     }
 }
