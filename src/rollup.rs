@@ -149,7 +149,7 @@ impl<'a> Context<'a> {
 
     #[inline(always)]
     fn parse_event<P: Payload>(&self, line: &[u8]) -> Option<(usize, PendingEvent<P>)> {
-        let [id, user, ts, ingest, kind, product, price] = input::fields(line)?;
+        let [id, user, ts, ingest, kind, product, price] = input::event_row(line)?;
         if id.is_empty() {
             return None;
         }

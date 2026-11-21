@@ -37,6 +37,70 @@ pub fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes.split(|&byte| byte == b'\n').skip(1)
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
+    use core::arch::x86_64::*;
+    let len = line.len();
+    if !(65..=128).contains(&len) {
+        return fields(line);
+    }
+    #[inline(always)]
+    unsafe fn masks(p: *const u8) -> (u64, u64) {
+        unsafe {
+            let a = _mm256_loadu_si256(p.cast());
+            let b = _mm256_loadu_si256(p.add(32).cast());
+            let mask = |c| {
+                let k = _mm256_set1_epi8(c);
+                let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, k)) as u32;
+                let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, k)) as u32;
+                u64::from(lo) | (u64::from(hi) << 32)
+            };
+            (mask(b',' as i8), mask(b'"' as i8))
+        }
+    }
+    let ((mut left, ql), (right, qr)) =
+        unsafe { (masks(line.as_ptr()), masks(line.as_ptr().add(len - 64))) };
+    let overlap = 128 - len;
+    if left.count_ones() + (right >> overlap).count_ones() != 6 {
+        return None;
+    }
+    if left.count_ones() < 3 || right.count_ones() < 3 {
+        return fields(line);
+    }
+    let mut right = right.reverse_bits();
+    let mut ends = [0; 7];
+    ends[6] = len;
+    for i in 0..3 {
+        ends[i] = left.trailing_zeros() as usize;
+        left &= left - 1;
+        ends[5 - i] = len - 1 - right.trailing_zeros() as usize;
+        right &= right - 1;
+    }
+    let mut row = [&[][..]; 7];
+    let mut start = 0;
+    let mut stripped = 0;
+    for (field, end) in row.iter_mut().zip(ends) {
+        let raw = &line[start..end];
+        let trim = usize::from(raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"');
+        *field = &raw[trim..raw.len() - trim];
+        start = end + 1;
+        stripped += 2 * trim as u32;
+    }
+    (stripped == ql.count_ones() + (qr >> overlap).count_ones()).then_some(row)
+}
+#[inline(always)]
+pub fn event_row(line: &[u8]) -> Option<[&[u8]; 7]> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        event_fields(line)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        fields(line)
+    }
+}
+
 #[inline(always)]
 pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
