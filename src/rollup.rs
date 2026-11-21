@@ -5,6 +5,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 pub const USER_GROUPS: usize = PARTITIONS * 2;
+const ID_PARTS: usize = 256;
 const INVALID_TIME: i64 = i64::MIN;
 const SESSION_GAP: i64 = 1_800_000;
 
@@ -193,7 +194,7 @@ pub struct Context<'a> {
 impl<'a> Context<'a> {
     #[inline]
     fn partition(&self, id: Key) -> usize {
-        id as usize & (PARTITIONS - 1)
+        id as usize & (ID_PARTS - 1)
     }
 
     #[inline(always)]
@@ -250,7 +251,7 @@ impl<'a> Context<'a> {
             .swap_bytes();
         let hint = self.people.hint(event.person);
         Some((
-            hint * PARTITIONS + self.partition(id),
+            hint * ID_PARTS + self.partition(id),
             PendingEvent { id, ingest, event },
         ))
     }
@@ -260,17 +261,17 @@ impl<'a> Context<'a> {
             files,
             self.workers,
             72,
-            PARTITIONS,
+            ID_PARTS,
             |line| self.parse_event(line),
             |batch| {
                 for (part, item) in batch {
                     if item.event.person != 0 {
                         item.event.person = self
                             .people
-                            .person_hinted(item.event.person, *part / PARTITIONS)
+                            .person_hinted(item.event.person, *part / ID_PARTS)
                             + 1;
                     }
-                    *part %= PARTITIONS;
+                    *part %= ID_PARTS;
                 }
             },
         )
@@ -289,7 +290,7 @@ impl<'a> Context<'a> {
                 let mut seen = vec![0u64; words];
                 let mut repeated = vec![0u64; words];
                 let position = |key: Key| {
-                    let word = (key as usize / PARTITIONS) & (words - 1);
+                    let word = (key as usize / ID_PARTS) & (words - 1);
                     let mask = (1u64 << ((key >> 35) & 63))
                         | (1u64 << ((key >> 48) & 63))
                         | (1u64 << ((key >> 57) & 63));
