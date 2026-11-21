@@ -35,6 +35,10 @@ pub fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 #[inline]
 pub fn fields<const N: usize>(mut line: &[u8]) -> Option<[&[u8]; N]> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if line.len() >= 32 && line.len() <= 96 {
+        return vector_fields(line);
+    }
     let mut result = [&[][..]; N];
     for (index, field) in result.iter_mut().enumerate() {
         let raw = if index + 1 == N {
@@ -59,6 +63,55 @@ pub fn fields<const N: usize>(mut line: &[u8]) -> Option<[&[u8]; N]> {
         *field = value;
     }
     Some(result)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn vector_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    use std::arch::x86_64::*;
+    let masks = |offset: usize| {
+        // The two end blocks can overlap. Both loads stay within this line.
+        unsafe {
+            let block = _mm256_loadu_si256(line.as_ptr().add(offset).cast());
+            let mask = |byte| {
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, _mm256_set1_epi8(byte))) as u32
+            };
+            (mask(b',' as i8), mask(b'"' as i8))
+        }
+    };
+    let (first, quotes) = masks(0);
+    let mut commas = u128::from(first);
+    let mut quotes = u128::from(quotes);
+    if line.len() > 64 {
+        let (middle, q) = masks(32);
+        commas |= u128::from(middle) << 32;
+        quotes |= u128::from(q) << 32;
+    }
+    let tail = line.len() - 32;
+    let (last, q) = masks(tail);
+    commas |= u128::from(last) << tail;
+    quotes |= u128::from(q) << tail;
+    if commas.count_ones() as usize != N - 1 {
+        return None;
+    }
+    commas |= 1 << line.len();
+    let mut start = 0;
+    let mut result = [&[][..]; N];
+    for field in &mut result {
+        let end = commas.trailing_zeros() as usize;
+        commas &= commas - 1;
+        *field = if quotes & (1 << start) != 0 {
+            if end < start + 2 || quotes & (1 << (end - 1)) == 0 {
+                return None;
+            }
+            quotes ^= (1 << start) | (1 << (end - 1));
+            &line[start + 1..end - 1]
+        } else {
+            &line[start..end]
+        };
+        start = end + 1;
+    }
+    (quotes == 0).then_some(result)
 }
 
 #[inline]
@@ -211,7 +264,10 @@ pub fn route<'a, T: Send>(
         .map(|index| {
             let mut shards = buckets();
             for chunk in chunks.iter().skip(index).step_by(groups) {
-                for line in chunk.split(|&byte| byte == b'\n') {
+                let mut start = 0;
+                for end in memchr::memchr_iter(b'\n', chunk).chain(std::iter::once(chunk.len())) {
+                    let line = &chunk[start..end];
+                    start = end + 1;
                     if let Some((partition, item)) = parse(line) {
                         shards[partition].push(item);
                     }
