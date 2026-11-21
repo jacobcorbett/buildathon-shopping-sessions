@@ -147,7 +147,7 @@ impl<'a> Context<'a> {
         self.hash.hash_one(id) as usize & (PARTITIONS - 1)
     }
 
-    #[inline]
+    #[inline(always)]
     fn parse_event<P: Payload>(&self, line: &[u8]) -> Option<(usize, PendingEvent<P>)> {
         let [id, user, ts, ingest, kind, product, price] = input::fields(line)?;
         if id.is_empty() {
@@ -260,9 +260,16 @@ impl<'a> Context<'a> {
                             if repeated[pos / 64] & (1u64 << (pos % 64)) == 0 {
                                 emit(item.event);
                             } else {
-                                let winner = winners.entry(item.id).or_insert(item);
-                                if item.ingest < winner.ingest {
-                                    *winner = item;
+                                use std::collections::hash_map::Entry;
+                                match winners.entry(item.id) {
+                                    Entry::Vacant(e) => {
+                                        e.insert(item);
+                                    }
+                                    Entry::Occupied(mut e) => {
+                                        if item.ingest < e.get().ingest {
+                                            e.insert(item);
+                                        }
+                                    }
                                 }
                             }
                         }

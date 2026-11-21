@@ -37,12 +37,17 @@ pub fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes.split(|&byte| byte == b'\n').skip(1)
 }
 
-#[inline]
-pub fn fields<const N: usize>(mut line: &[u8]) -> Option<[&[u8]; N]> {
+#[inline(always)]
+pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if (32..=128).contains(&line.len()) {
         return masked_fields(line);
     }
+    scalar_fields(line)
+}
+
+#[inline(never)]
+fn scalar_fields<const N: usize>(mut line: &[u8]) -> Option<[&[u8]; N]> {
     let mut result = [&[][..]; N];
     for (index, field) in result.iter_mut().enumerate() {
         let raw = if index + 1 == N {
@@ -71,7 +76,7 @@ pub fn fields<const N: usize>(mut line: &[u8]) -> Option<[&[u8]; N]> {
 
 // Read overlapping vectors at the tail so every load stays within the line.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[inline]
+#[inline(always)]
 fn masked_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     use core::arch::x86_64::*;
     let mut commas = 0u128;
@@ -222,7 +227,7 @@ fn ascii_calendar(bytes: &[u8]) -> Option<i64> {
     Some(days * DAY + i64::from((hour * 60 + minute) * 60 + second) * 1000)
 }
 
-#[inline]
+#[inline(always)]
 pub fn timestamp(bytes: &[u8]) -> Option<i64> {
     if !matches!(bytes.len(), 20 | 25) || bytes[4] != b'-' {
         return i64::try_from(number(bytes)?).ok();
@@ -367,9 +372,18 @@ impl People {
             overflow: std::array::from_fn(|_| Mutex::default()),
         }
     }
-    #[inline]
+    #[inline(always)]
     pub fn person(&self, key: Key) -> Key {
         let hash = self.hash.hash_one(key) as usize;
+        let mask = self.slots.len() - 1;
+        let first = hash & mask;
+        if self.slots[first].load(Relaxed) == key {
+            return first as Key;
+        }
+        self.insert_or_probe(key, hash)
+    }
+    #[inline(never)]
+    fn insert_or_probe(&self, key: Key, hash: usize) -> Key {
         let mask = self.slots.len() - 1;
         for offset in 0..self.slots.len().min(16) {
             let i = hash.wrapping_add(offset) & mask;
@@ -386,6 +400,10 @@ impl People {
                 return i as Key;
             }
         }
+        self.extra(key, hash)
+    }
+    #[cold]
+    fn extra(&self, key: Key, hash: usize) -> Key {
         let bucket = hash % 64;
         let mut extra = self.overflow[bucket].lock().unwrap();
         let extra = &mut *extra;
