@@ -5,7 +5,7 @@ use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use std::sync::{
     Mutex,
-    atomic::{AtomicU64, Ordering::Relaxed},
+    atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
 };
 use std::{fs, io, path::Path};
 
@@ -511,46 +511,71 @@ pub fn route<'a, T: Send, U: Send>(
     prepare: impl Fn(&mut [(usize, T)]) + Sync,
     store: impl Fn(T) -> U + Sync,
 ) -> Vec<Shards<U>> {
-    let chunks = chunks(files);
-    let groups = (workers * 4).min(chunks.len()).max(1);
-    // Interleave chunks to spread long and short files across workers.
-    let parts = (0..groups)
+    let mut chunks = chunks(files);
+    // Claim the largest chunks first. A later claim is then no longer than
+    // the chunk just read, so a segment can stop before exceeding its budget.
+    chunks.sort_unstable_by_key(|chunk| std::cmp::Reverse(chunk.len()));
+    let workers = workers.max(1);
+    let smallest_budget = 2 * chunks.first().map_or(0, |chunk| chunk.len());
+    let next = AtomicUsize::new(0);
+    let unclaimed = AtomicUsize::new(chunks.iter().map(|chunk| chunk.len()).sum());
+    let claim = || {
+        let chunk = chunks.get(next.fetch_add(1, Relaxed))?;
+        unclaimed.fetch_sub(chunk.len(), Relaxed);
+        Some(*chunk)
+    };
+    // Workers claim chunks until none remain, so one delayed by concurrent
+    // work claims fewer. Each segment is sized for an even share of the work
+    // that remained when it opened, keeping buffers close to their contents.
+    let parts: Vec<Vec<Shards<U>>> = (0..workers)
         .into_par_iter()
-        .map(|index| {
-            let assigned = chunks.iter().skip(index).step_by(groups);
-            let bytes: usize = assigned.clone().map(|chunk| chunk.len()).sum();
-            let mut shards: Shards<U> = (0..partitions)
-                .map(|_| Vec::with_capacity(bytes / bytes_per_row / partitions))
-                .collect();
+        .map(|_| {
+            let mut segments = Vec::new();
             let mut batch = Vec::with_capacity(64);
-            let mut flush = |batch: &mut Vec<(usize, T)>| {
-                prepare(batch);
-                for (partition, item) in batch.drain(..) {
-                    shards[partition].push(store(item));
-                }
-            };
-            for chunk in assigned {
-                for line in memchr::memchr_iter(b'\n', chunk)
-                    .chain(std::iter::once(chunk.len()))
-                    .scan(0, |start, end| {
-                        let line = chunk.get(*start..end)?;
-                        *start = end + 1;
-                        Some(line)
-                    })
-                {
-                    if let Some((partition, item)) = parse(line) {
-                        batch.push((partition, item));
-                        if batch.len() == 64 {
-                            flush(&mut batch);
+            let mut current = claim();
+            while let Some(first) = current {
+                let budget = (unclaimed.load(Relaxed) + first.len())
+                    .div_ceil(workers)
+                    .max(smallest_budget);
+                let mut shards: Shards<U> = (0..partitions)
+                    .map(|_| Vec::with_capacity(budget / bytes_per_row / partitions))
+                    .collect();
+                let mut flush = |batch: &mut Vec<(usize, T)>| {
+                    prepare(batch);
+                    for (partition, item) in batch.drain(..) {
+                        shards[partition].push(store(item));
+                    }
+                };
+                let mut claimed = 0;
+                while let Some(chunk) = current {
+                    for line in memchr::memchr_iter(b'\n', chunk)
+                        .chain(std::iter::once(chunk.len()))
+                        .scan(0, |start, end| {
+                            let line = chunk.get(*start..end)?;
+                            *start = end + 1;
+                            Some(line)
+                        })
+                    {
+                        if let Some((partition, item)) = parse(line) {
+                            batch.push((partition, item));
+                            if batch.len() == 64 {
+                                flush(&mut batch);
+                            }
                         }
                     }
+                    claimed += chunk.len();
+                    current = claim();
+                    if claimed + chunk.len() > budget {
+                        break;
+                    }
                 }
+                flush(&mut batch);
+                segments.push(shards);
             }
-            flush(&mut batch);
-            shards
+            segments
         })
         .collect();
-    transpose(parts, partitions)
+    transpose(parts.into_iter().flatten().collect(), partitions)
 }
 
 #[inline]
