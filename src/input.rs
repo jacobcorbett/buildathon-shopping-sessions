@@ -148,16 +148,44 @@ fn pair(bytes: &[u8], start: usize) -> Option<u32> {
 
 #[inline]
 fn ascii_calendar(bytes: &[u8]) -> Option<i64> {
-    if bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
+    // Parsed days recur across both event and ingest timestamps. Use the
+    // entire date as the tag so out-of-window and malformed dates stay exact.
+    thread_local! {
+        static DAYS: [std::cell::Cell<([u8; 10], i64)>; 32] =
+            const { [const { std::cell::Cell::new(([0; 10], 0)) }; 32] };
+    }
+    let date: [u8; 10] = bytes[..10].try_into().unwrap();
+    let index = (usize::from(date[8]) * 10 + usize::from(date[9])) & 31;
+    let midnight = DAYS.with(|slots| {
+        let (tag, value) = slots[index].get();
+        if tag == date {
+            return Some(value);
+        }
+        let value = calendar_day(bytes)?;
+        slots[index].set((date, value));
+        Some(value)
+    })?;
+    if bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let hour = pair(bytes, 11)?;
+    let minute = pair(bytes, 14)?;
+    let second = pair(bytes, 17)?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some(midnight + i64::from((hour * 60 + minute) * 60 + second) * 1000)
+}
+
+#[inline]
+fn calendar_day(bytes: &[u8]) -> Option<i64> {
+    if bytes[7] != b'-' {
         return None;
     }
     let year = pair(bytes, 0)? * 100 + pair(bytes, 2)?;
     let month = pair(bytes, 5)?;
     let day = pair(bytes, 8)?;
-    let hour = pair(bytes, 11)?;
-    let minute = pair(bytes, 14)?;
-    let second = pair(bytes, 17)?;
-    if !(1..=12).contains(&month) || day == 0 || hour > 23 || minute > 59 || second > 59 {
+    if !(1..=12).contains(&month) || day == 0 {
         return None;
     }
     let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
@@ -187,7 +215,7 @@ fn ascii_calendar(bytes: &[u8]) -> Option<i64> {
     let day_in_year = i64::from((153 * march_month + 2) / 5 + day - 1);
     let days = era * 146097 + year_in_era * 365 + year_in_era / 4 - year_in_era / 100 + day_in_year
         - 719468;
-    Some(days * DAY + i64::from((hour * 60 + minute) * 60 + second) * 1000)
+    Some(days * DAY)
 }
 
 #[inline]
