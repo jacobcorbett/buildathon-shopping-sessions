@@ -524,9 +524,11 @@ impl People {
     }
     #[inline(always)]
     pub fn person(&self, key: Key) -> Key {
-        let hash = self.hash.hash_one(key) as usize;
-        let mask = self.slots.len() - 1;
-        let first = hash & mask;
+        self.person_hinted(key, self.hash.hash_one(key) as usize)
+    }
+    #[inline(always)]
+    pub fn person_hinted(&self, key: Key, hash: usize) -> Key {
+        let first = hash & (self.slots.len() - 1);
         if self.slots[first].load(Relaxed) == key {
             return first as Key;
         }
@@ -565,9 +567,11 @@ impl People {
         (self.slots.len() + index * 64 + bucket) as Key
     }
     #[inline]
-    pub fn prefetch(&self, key: Key) {
-        let i = self.hash.hash_one(key) as usize & (self.slots.len() - 1);
-        prefetch(&self.slots[i]);
+    pub fn hint(&self, key: Key) -> usize {
+        let mask = self.slots.len() - 1;
+        let hash = self.hash.hash_one(key) as usize & (mask | 63);
+        prefetch(&self.slots[hash & mask]);
+        hash
     }
     pub fn key(&self, person: Key) -> Key {
         let id = person as usize;
@@ -639,8 +643,8 @@ pub fn aliases(files: &[Mmap], names: &Names, people: &People) -> Aliases {
     let mut pending = Vec::with_capacity(64);
     let mut join = |pending: &mut Vec<(Key, Key, Key, Key)>| {
         for &(a, b, _, _) in &*pending {
-            people.prefetch(a);
-            people.prefetch(b);
+            people.hint(a);
+            people.hint(b);
         }
         for (a, b, _, _) in &mut *pending {
             *a = people.person(*a);

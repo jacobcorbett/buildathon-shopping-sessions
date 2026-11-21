@@ -195,7 +195,11 @@ impl<'a> Context<'a> {
             payload: P::encode(data.time, data.price, data.category, self.start),
         };
         let id = self.names.key(id);
-        Some((self.partition(id), PendingEvent { id, ingest, event }))
+        let hint = self.people.hint(event.person);
+        Some((
+            hint * PARTITIONS + self.partition(id),
+            PendingEvent { id, ingest, event },
+        ))
     }
 
     pub fn read_events<P: Payload>(&self, files: &[Mmap]) -> Vec<Shards<PendingEvent<P>>> {
@@ -206,13 +210,14 @@ impl<'a> Context<'a> {
             PARTITIONS,
             |line| self.parse_event(line),
             |batch| {
-                for (_, item) in &*batch {
-                    self.people.prefetch(item.event.person);
-                }
-                for (_, item) in batch {
+                for (part, item) in batch {
                     if item.event.person != 0 {
-                        item.event.person = self.people.person(item.event.person) + 1;
+                        item.event.person = self
+                            .people
+                            .person_hinted(item.event.person, *part / PARTITIONS)
+                            + 1;
                     }
+                    *part %= PARTITIONS;
                 }
             },
         )
@@ -305,7 +310,7 @@ impl<'a> Context<'a> {
                 // Repeated click IDs have identical values. Keeping copies cannot
                 // change the winning click or whether a campaign is active.
                 Some((
-                    person as usize % USER_GROUPS,
+                    self.people.hint(person),
                     Click {
                         person,
                         time,
@@ -315,11 +320,12 @@ impl<'a> Context<'a> {
                 ))
             },
             |batch| {
-                for (_, click) in &*batch {
-                    self.people.prefetch(click.person);
+                for (hint, click) in batch.iter_mut() {
+                    click.person = self.people.person_hinted(click.person, *hint);
+                    aliases.prefetch(click.person);
                 }
                 for (part, click) in batch {
-                    click.person = aliases.person(self.people.person(click.person));
+                    click.person = aliases.person(click.person);
                     *part = click.person as usize % USER_GROUPS;
                 }
             },
